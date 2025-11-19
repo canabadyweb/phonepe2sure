@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
 """
-phonepe_pdf2txt_parser_v2.py
-
-Same as previous version, but:
-- created_at = parsed from Date + Time (YYYY-MM-DD HH:MM:SS.microseconds)
-- updated_at = current timestamp only
+phonepe_expense_update.py
 
 Usage:
-    python phonepe_pdf2txt_parser_v2.py input.pdf output.csv
-    python phonepe_pdf2txt_parser_v2.py input.txt output.csv
+    python phonepe_expense_update.py input.pdf
 """
 
 import re
@@ -25,6 +20,7 @@ import pandas as pd
 from PyPDF2 import PdfReader, PdfWriter
 
 import psycopg2
+from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 import ipdb
 
@@ -80,6 +76,20 @@ accounts = [
         'transaction_name': 'PRIYA AGENCY'
     },
 ]
+
+
+def txn_exists(conn, txn):
+    q = """
+        SELECT EXISTS (
+            SELECT 1
+            FROM entries
+            WHERE source = %s
+               OR external_id = %s
+        );
+    """
+    with conn.cursor() as cur:
+        cur.execute(q, (txn['transaction_id'], txn['utr_no']))
+        return cur.fetchone()[0]
 
 def find_account_id(paid_to, accounts):
     if not paid_to:
@@ -349,82 +359,88 @@ def insert_into_postgres(conn, transactions):
                 # For transfer transactions, skip it as it doesn't work
                 continue
 
-                # Insert into account_transactions
-                cur.execute("""
-                    INSERT INTO transactions ("created_at", "updated_at",
-                                              "category_id", "merchant_id",
-                                              "locked_attributes", "kind",
-                                              "external_id")
-                    VALUES (%s, %s, NULL, NULL, '{}', 'funds_movement', NULL)
-                    RETURNING id
-                """, (txn['created_at'], txn['updated_at']))
-                entryable_id = cur.fetchone()[0]
-
-
-                # Insert into account_entries
-
-                if float(txn['amount']) > 0:
-                    # Inflow transfer
-                    cur.execute("""
-                        INSERT INTO entries (
-                            account_id, entryable_type, entryable_id, amount, currency, date, name,
-                            created_at, updated_at, import_id, notes, excluded, plaid_id, locked_attributes, external_id, source
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, 'Added via automation-script', false, NULL, '{}', %s, %s)
-                    """, (account_id, 'Transaction', entryable_id, f"-{abs(float(txn['amount'])):.2f}", 'INR', txn['date'],
-                          f"Transfer from {txn['name']}", txn['created_at'], txn['updated_at'], txn['utr_no'], txn['transaction_id']))
-
-                    cur.execute("""
-                        INSERT INTO entries (
-                            account_id, entryable_type, entryable_id, amount, currency, date, name,
-                            created_at, updated_at, import_id, notes, excluded, plaid_id, locked_attributes, external_id, source
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, 'Added via automation-script', false, NULL, '{}', NULL, NULL)
-                    """, (self_account_id, 'Transaction', entryable_id, f"{abs(float(txn['amount'])):.2f}", 'INR', txn['date'],
-                          f"Transfer to PSG SBI AC", txn['created_at'], txn['updated_at']))
-                else:
-                    # Outflow transfer
-                    cur.execute("""
-                        INSERT INTO entries (
-                            account_id, entryable_type, entryable_id, amount, currency, date, name,
-                            created_at, updated_at, import_id, notes, excluded, plaid_id, locked_attributes, external_id, source
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, 'Added via automation-script', false, NULL, '{}', NULL, NULL)
-                    """, (self_account_id, 'Transaction', entryable_id, f"{abs(float(txn['amount'])):.2f}", 'INR', txn['date'],
-                          f"Transfer from PSG SBI AC", txn['created_at'], txn['updated_at']))
-
-                    cur.execute("""
-                        INSERT INTO entries (
-                            account_id, entryable_type, entryable_id, amount, currency, date, name,
-                            created_at, updated_at, import_id, notes, excluded, plaid_id, locked_attributes, external_id, source
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, 'Added via automation-script', false, NULL, '{}', %s, %s)
-                    """, (account_id, 'Transaction', entryable_id, f"-{abs(float(txn['amount'])):.2f}", 'INR', txn['date'],
-                          f"Transfer to {txn['name']}", txn['created_at'], txn['updated_at'], txn['utr_no'], txn['transaction_id']))
+                # # Insert into account_transactions
+                # cur.execute("""
+                #     INSERT INTO transactions ("created_at", "updated_at",
+                #                               "category_id", "merchant_id",
+                #                               "locked_attributes", "kind",
+                #                               "external_id")
+                #     VALUES (%s, %s, NULL, NULL, '{}', 'funds_movement', NULL)
+                #     RETURNING id
+                # """, (txn['created_at'], txn['updated_at']))
+                # entryable_id = cur.fetchone()[0]
+                #
+                #
+                # # Insert into account_entries
+                #
+                # if float(txn['amount']) > 0:
+                #     # Inflow transfer
+                #     cur.execute("""
+                #         INSERT INTO entries (
+                #             account_id, entryable_type, entryable_id, amount, currency, date, name,
+                #             created_at, updated_at, import_id, notes, excluded, plaid_id, locked_attributes, external_id, source
+                #         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, 'Added via automation-script', false, NULL, '{}', %s, %s)
+                #     """, (account_id, 'Transaction', entryable_id, f"-{abs(float(txn['amount'])):.2f}", 'INR', txn['date'],
+                #           f"Transfer from {txn['name']}", txn['created_at'], txn['updated_at'], txn['utr_no'], txn['transaction_id']))
+                #
+                #     cur.execute("""
+                #         INSERT INTO entries (
+                #             account_id, entryable_type, entryable_id, amount, currency, date, name,
+                #             created_at, updated_at, import_id, notes, excluded, plaid_id, locked_attributes, external_id, source
+                #         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, 'Added via automation-script', false, NULL, '{}', NULL, NULL)
+                #     """, (self_account_id, 'Transaction', entryable_id, f"{abs(float(txn['amount'])):.2f}", 'INR', txn['date'],
+                #           f"Transfer to PSG SBI AC", txn['created_at'], txn['updated_at']))
+                # else:
+                #     # Outflow transfer
+                #     cur.execute("""
+                #         INSERT INTO entries (
+                #             account_id, entryable_type, entryable_id, amount, currency, date, name,
+                #             created_at, updated_at, import_id, notes, excluded, plaid_id, locked_attributes, external_id, source
+                #         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, 'Added via automation-script', false, NULL, '{}', NULL, NULL)
+                #     """, (self_account_id, 'Transaction', entryable_id, f"{abs(float(txn['amount'])):.2f}", 'INR', txn['date'],
+                #           f"Transfer from PSG SBI AC", txn['created_at'], txn['updated_at']))
+                #
+                #     cur.execute("""
+                #         INSERT INTO entries (
+                #             account_id, entryable_type, entryable_id, amount, currency, date, name,
+                #             created_at, updated_at, import_id, notes, excluded, plaid_id, locked_attributes, external_id, source
+                #         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, 'Added via automation-script', false, NULL, '{}', %s, %s)
+                #     """, (account_id, 'Transaction', entryable_id, f"-{abs(float(txn['amount'])):.2f}", 'INR', txn['date'],
+                #           f"Transfer to {txn['name']}", txn['created_at'], txn['updated_at'], txn['utr_no'], txn['transaction_id']))
 
 
             else:
-                # Insert into account_transactions
-                cur.execute("""
-                    INSERT INTO transactions ("created_at", "updated_at",
-                                              "category_id", "merchant_id",
-                                              "locked_attributes", "kind",
-                                              "external_id")
-                    VALUES (%s, %s, NULL, NULL, '{}', 'standard', NULL)
-                    RETURNING id
-                """, (txn['created_at'], txn['updated_at']))
-                entryable_id = cur.fetchone()[0]
+                if txn_exists(conn, txn):
+                    print(f"\nError: Transaction already exists: {txn}")
+                else:
+                    print(f"\nNew transaction: {txn}\n")
 
-                cur.execute("""
-                    INSERT INTO entries (
-                        account_id, entryable_type, entryable_id, amount, currency, date, name,
-                        created_at, updated_at, import_id, notes, excluded, plaid_id, locked_attributes, external_id, source
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, 'Added via automation-script', false, NULL, '{}', %s, %s)
-                """, (self_account_id, 'Transaction', entryable_id, f"{abs(float(txn['amount'])):.2f}", 'INR', txn['date'],
-                      txn['name'], txn['created_at'], txn['updated_at'], txn['utr_no'], txn['transaction_id']))
+                    # Insert into account_transactions
 
-                # It is a standard expense
+                    # It is a standard expense
+                    cur.execute("""
+                        INSERT INTO transactions ("created_at", "updated_at",
+                                                  "category_id", "merchant_id",
+                                                  "locked_attributes", "kind",
+                                                  "external_id")
+                        VALUES (%s, %s, NULL, NULL, '{}', 'standard', NULL)
+                        RETURNING id
+                    """, (txn['created_at'], txn['updated_at']))
+                    entryable_id = cur.fetchone()[0]
+
+                    cur.execute("""
+                        INSERT INTO entries (
+                            account_id, entryable_type, entryable_id, amount, currency, date, name,
+                            created_at, updated_at, import_id, notes, excluded, plaid_id, locked_attributes, external_id, source
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, 'Added via automation-script', false, NULL, '{}', %s, %s)
+                    """, (self_account_id, 'Transaction', entryable_id, f"{abs(float(txn['amount'])):.2f}", 'INR', txn['date'],
+                          txn['name'], txn['created_at'], txn['updated_at'], txn['utr_no'], txn['transaction_id']))
+
         conn.commit()
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python phonepe_pdf2txt_parser_v2.py input.pdf|input.txt output.csv")
+        print("Usage: python phonepe_expense_update.py input.pdf")
         return
 
     inp = Path(sys.argv[1])
@@ -451,18 +467,19 @@ def main():
 
         # print(records)
         insert_into_postgres(conn, records)
-        print(f"Inserted {len(records)} transactions into PostgreSQL.")
+        # print(f"Inserted {len(records)} transactions into PostgreSQL.")
     else:
         print("No new transactions found.")
 
     conn.close()
 
-    df = pd.DataFrame(records, columns=[
-        "Date","Time","created_at","updated_at",
-        "Paid to","Transaction ID","UTR No","Debit/Credit","Amount"
-    ])
-    df.to_csv(out, index=False, quoting=csv.QUOTE_MINIMAL)
-    print(f"Saved {len(df)} rows -> {out}")
+    # Save records to output.csv
+    # df = pd.DataFrame(records, columns=[
+    #     "Date","Time","created_at","updated_at",
+    #     "Paid to","Transaction ID","UTR No","Debit/Credit","Amount"
+    # ])
+    # df.to_csv(out, index=False, quoting=csv.QUOTE_MINIMAL)
+    # print(f"Saved {len(df)} rows -> {out}")
 
 if __name__ == "__main__":
     main()
