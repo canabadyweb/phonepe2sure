@@ -13,6 +13,7 @@ Usage:
 
 import re
 import sys
+import os
 import csv
 import shutil
 import subprocess
@@ -23,6 +24,10 @@ from datetime import datetime
 import pandas as pd
 from PyPDF2 import PdfReader, PdfWriter
 
+import psycopg2
+from dotenv import load_dotenv
+import ipdb
+
 DATE_FIND_RE = re.compile(r'([A-Za-z]{3,9}\s*\d{1,2},\s*\d{4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}-\d{1,2}-\d{1,2})')
 TIME_FIND_RE = re.compile(r'(\d{1,2}:\d{2}\s*(?:AM|PM))', re.IGNORECASE)
 AMOUNT_RE = re.compile(r'([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)|\d+(?:\.[0-9]+)?)')
@@ -31,6 +36,110 @@ TXN_ID_RE = re.compile(r'Transaction\s*ID\s*[:\-\s]*([A-Za-z0-9]+)', re.IGNORECA
 UTR_RE = re.compile(r'UTR\s*No\s*[:\-\s]*([A-Za-z0-9]+)', re.IGNORECASE)
 DEBIT_WORD_RE = re.compile(r'\bDebit\b', re.IGNORECASE)
 CREDIT_WORD_RE = re.compile(r'\bCredit\b', re.IGNORECASE)
+
+
+accounts = [
+    {
+        'account_name': 'PSG SBI AC',
+        'account_id': '54f3d108-9ed2-446c-a489-ed1c2ffdf5b0',
+        'transaction_name': 'SELF'
+    },
+    {
+        'account_name': 'PSM AC',
+        'account_id': '927a3ee1-3963-4ebf-97cd-137910e155c3',
+        'transaction_name': 'P SELVAM'
+    },
+    {
+        'account_name': 'PSK SBI AC',
+        'account_id': '2afe1683-e05d-442f-ab1b-159d92d1b34e',
+        'transaction_name': 'SELVAKUMARAN P'
+    },
+    {
+        'account_name': 'PSS SBI AC',
+        'account_id': 'f7b7839c-1fb4-429c-8088-441bf01a14a7',
+        'transaction_name': 'SELVASANKAR P'
+    },
+    {
+        'account_name': 'Dad SBI AC',
+        'account_id': '7b58df97-381d-45a4-882e-d8364f793fbc',
+        'transaction_name': 'PERUMAL R'
+    },
+    {
+        'account_name': 'Cloudtree AC',
+        'account_id': 'ca529321-4bf8-430c-aab5-90c333ca34a3',
+        'transaction_name': 'CLOUDTREE'
+    },
+    {
+        'account_name': 'PhonePe Wallet',
+        'account_id': '340ca703-1057-4ce9-a038-730a26d20aea',
+        'transaction_name': 'PhonePe Wallet'
+    },
+    {
+        'account_name': 'PRIYA AGENCY (GAJENDIRAN) AC',
+        'account_id': 'f2c6a294-db59-4336-88b4-c7f77298732b',
+        'transaction_name': 'PRIYA AGENCY'
+    },
+]
+
+def find_account_id(paid_to, accounts):
+    if not paid_to:
+        return None
+
+    p = paid_to.lower().replace("  ", " ").strip()
+
+    # 1. exact match
+    for acc in accounts:
+        if acc["transaction_name"].lower() == p:
+            return acc["account_id"]
+
+    # 2. substring match
+    for acc in accounts:
+        if acc["transaction_name"].lower() in p:
+            return acc["account_id"]
+
+    # 3. fuzzy word-level match
+    pw = set(p.split())
+    for acc in accounts:
+        aw = set(acc["transaction_name"].lower().split())
+        if aw.issubset(pw):
+            return acc["account_id"]
+
+    return None
+
+def connect_to_postgres():
+    """Establish and return a PostgreSQL connection."""
+
+    # Load environment variables
+    load_dotenv()
+
+    try:
+        conn = psycopg2.connect(
+            host=os.getenv("SURE_DB_HOST"),
+            port=os.getenv("SURE_DB_PORT"),
+            database=os.getenv("SURE_DB_NAME"),
+            user=os.getenv("SURE_DB_USER"),
+            password=os.getenv("SURE_DB_PASSWORD"),
+        )
+        return conn
+    except Exception as e:
+        print(f"Database connection failed: {e}")
+        return None
+
+def get_last_transaction_date(conn):
+    """Fetch the last transaction date from the database to filter new tx."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT MAX(created_at) FROM entries;")
+        last_date = cur.fetchone()[0]
+        # print(last_date)
+        # last_date = convert_to_date_format(
+        #     last_date.strftime("%Y-%m-%d %H:%M:%S.%f"))
+        # last_date = last_date.strftime("%Y-%m-%d %H:%M:%S.%f")
+        # print(last_date.timestamp())
+        # sys.exit(0)
+        if last_date:
+            return int(last_date.timestamp()+2000)
+    return None
 
 def find_pdf2txt_cmd():
     for name in ("pdf2txt.py", "pdf2txt"):
@@ -200,15 +309,15 @@ def parse_pdf2txt_lines(lines):
         # To skip the first heading which is not a transaction record
         if "Date Transaction Details" not in paid_to:
             records.append({
-                "Date": date_norm,
-                "Time": time_norm,
+                "date": date_norm,
+                "time": time_norm,
                 "created_at": created_at,
                 "updated_at": updated_at,
-                "Paid to": paid_to,
-                "Transaction ID": txn_id,
-                "UTR No": utr,
-                "Debit/Credit": dtype,
-                "Amount": amount
+                "name": paid_to,
+                "transaction_id": txn_id,
+                "utr_no": utr,
+                "type": dtype,
+                "amount": amount
             })
     return records
 
@@ -217,13 +326,110 @@ def parse_txt_file(txt_path: Path):
         lines = [ln.rstrip("\n") for ln in f]
     return parse_pdf2txt_lines(lines)
 
+def insert_into_postgres(conn, transactions):
+    """Insert transaction data into PostgreSQL."""
+
+    with conn.cursor() as cur:
+        for txn in transactions:
+
+            txn_date = datetime.strptime(txn['date'], "%Y-%m-%d").date()
+            given_date = datetime.strptime("2025-10-30", "%Y-%m-%d").date()
+            if txn_date < given_date:
+                continue
+
+            # funds_movement
+
+            self_account_id = '54f3d108-9ed2-446c-a489-ed1c2ffdf5b0'
+            account_id = find_account_id(txn["name"], accounts)
+
+            # ipdb.set_trace()
+
+            # It is a transfer
+            if account_id:
+                # For transfer transactions, skip it as it doesn't work
+                continue
+
+                # Insert into account_transactions
+                cur.execute("""
+                    INSERT INTO transactions ("created_at", "updated_at",
+                                              "category_id", "merchant_id",
+                                              "locked_attributes", "kind",
+                                              "external_id")
+                    VALUES (%s, %s, NULL, NULL, '{}', 'funds_movement', NULL)
+                    RETURNING id
+                """, (txn['created_at'], txn['updated_at']))
+                entryable_id = cur.fetchone()[0]
+
+
+                # Insert into account_entries
+
+                if float(txn['amount']) > 0:
+                    # Inflow transfer
+                    cur.execute("""
+                        INSERT INTO entries (
+                            account_id, entryable_type, entryable_id, amount, currency, date, name,
+                            created_at, updated_at, import_id, notes, excluded, plaid_id, locked_attributes, external_id, source
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, 'Added via automation-script', false, NULL, '{}', %s, %s)
+                    """, (account_id, 'Transaction', entryable_id, f"-{abs(float(txn['amount'])):.2f}", 'INR', txn['date'],
+                          f"Transfer from {txn['name']}", txn['created_at'], txn['updated_at'], txn['utr_no'], txn['transaction_id']))
+
+                    cur.execute("""
+                        INSERT INTO entries (
+                            account_id, entryable_type, entryable_id, amount, currency, date, name,
+                            created_at, updated_at, import_id, notes, excluded, plaid_id, locked_attributes, external_id, source
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, 'Added via automation-script', false, NULL, '{}', NULL, NULL)
+                    """, (self_account_id, 'Transaction', entryable_id, f"{abs(float(txn['amount'])):.2f}", 'INR', txn['date'],
+                          f"Transfer to PSG SBI AC", txn['created_at'], txn['updated_at']))
+                else:
+                    # Outflow transfer
+                    cur.execute("""
+                        INSERT INTO entries (
+                            account_id, entryable_type, entryable_id, amount, currency, date, name,
+                            created_at, updated_at, import_id, notes, excluded, plaid_id, locked_attributes, external_id, source
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, 'Added via automation-script', false, NULL, '{}', NULL, NULL)
+                    """, (self_account_id, 'Transaction', entryable_id, f"{abs(float(txn['amount'])):.2f}", 'INR', txn['date'],
+                          f"Transfer from PSG SBI AC", txn['created_at'], txn['updated_at']))
+
+                    cur.execute("""
+                        INSERT INTO entries (
+                            account_id, entryable_type, entryable_id, amount, currency, date, name,
+                            created_at, updated_at, import_id, notes, excluded, plaid_id, locked_attributes, external_id, source
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, 'Added via automation-script', false, NULL, '{}', %s, %s)
+                    """, (account_id, 'Transaction', entryable_id, f"-{abs(float(txn['amount'])):.2f}", 'INR', txn['date'],
+                          f"Transfer to {txn['name']}", txn['created_at'], txn['updated_at'], txn['utr_no'], txn['transaction_id']))
+
+
+            else:
+                # Insert into account_transactions
+                cur.execute("""
+                    INSERT INTO transactions ("created_at", "updated_at",
+                                              "category_id", "merchant_id",
+                                              "locked_attributes", "kind",
+                                              "external_id")
+                    VALUES (%s, %s, NULL, NULL, '{}', 'standard', NULL)
+                    RETURNING id
+                """, (txn['created_at'], txn['updated_at']))
+                entryable_id = cur.fetchone()[0]
+
+                cur.execute("""
+                    INSERT INTO entries (
+                        account_id, entryable_type, entryable_id, amount, currency, date, name,
+                        created_at, updated_at, import_id, notes, excluded, plaid_id, locked_attributes, external_id, source
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, 'Added via automation-script', false, NULL, '{}', %s, %s)
+                """, (self_account_id, 'Transaction', entryable_id, f"{abs(float(txn['amount'])):.2f}", 'INR', txn['date'],
+                      txn['name'], txn['created_at'], txn['updated_at'], txn['utr_no'], txn['transaction_id']))
+
+                # It is a standard expense
+        conn.commit()
+
 def main():
-    if len(sys.argv) < 3:
+    if len(sys.argv) < 2:
         print("Usage: python phonepe_pdf2txt_parser_v2.py input.pdf|input.txt output.csv")
         return
 
     inp = Path(sys.argv[1])
-    out = Path(sys.argv[2])
+    # out = Path(sys.argv[2])
+    out = "output.csv"
 
     if inp.suffix.lower() == ".pdf":
         pdf_to_parse = decrypt_pdf_if_needed(inp)
@@ -233,6 +439,23 @@ def main():
         tmp.unlink(missing_ok=True)
     else:
         records = parse_txt_file(inp)
+
+
+    conn = connect_to_postgres()
+    # ipdb.set_trace()
+    if not conn:
+        print("Postgres DB connection unsuccessful")
+        return
+
+    if records:
+
+        # print(records)
+        insert_into_postgres(conn, records)
+        print(f"Inserted {len(records)} transactions into PostgreSQL.")
+    else:
+        print("No new transactions found.")
+
+    conn.close()
 
     df = pd.DataFrame(records, columns=[
         "Date","Time","created_at","updated_at",
