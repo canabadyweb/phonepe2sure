@@ -1,7 +1,27 @@
-#!/usr/bin/env python3
-"""
-phonepe_expense_update_tuned_v2.py
 
+# --- Logging setup: file + console, non-destructive ---
+import logging, os, json
+LOG_FILE = os.path.abspath("phonepe_debug.log")
+root_logger = logging.getLogger()
+# remove existing handlers to avoid duplicates
+for h in list(root_logger.handlers):
+    root_logger.removeHandler(h)
+# file handler (DEBUG)
+fh = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
+fh.setLevel(logging.DEBUG)
+# console handler (INFO+)
+sh = logging.StreamHandler()
+sh.setLevel(logging.INFO)
+fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+fh.setFormatter(fmt)
+sh.setFormatter(fmt)
+root_logger.addHandler(fh)
+root_logger.addHandler(sh)
+root_logger.setLevel(logging.DEBUG)
+logger = logging.getLogger(__name__)
+logger.info("Logging initialized. Writing to %s", LOG_FILE)
+
+"""
 Fine-tuned PhonePe parser + Postgres inserter adapted to your DB schema.
 
 Key changes from previous version:
@@ -39,10 +59,12 @@ from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader, PdfWriter
 
+# from transfer_helper import perform_transfer_advanced
+
 # set Decimal precision sufficiently high
 getcontext().prec = 28
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
 
 # regexes
 DATE_FIND_RE = re.compile(r'([A-Za-z]{3,9}\s*\d{1,2},\s*\d{4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}-\d{1,2}-\d{1,2})')
@@ -57,6 +79,16 @@ CREDIT_WORD_RE = re.compile(r'\bCredit\b', re.IGNORECASE)
 HEADER_KEYWORDS = ["date transaction details", "transaction details", "date transaction details type amount"]
 
 DEFAULT_SELF_ACCOUNT_ID = os.getenv("SURE_SELF_ACCOUNT_ID", "54f3d108-9ed2-446c-a489-ed1c2ffdf5b0")
+
+accounts = [
+    { 'account_name': 'PSG SBI AC', 'account_id': '54f3d108-9ed2-446c-a489-ed1c2ffdf5b0', 'transaction_name': 'SELF' },
+    { 'account_name': 'PSM AC', 'account_id': '927a3ee1-3963-4ebf-97cd-137910e155c3', 'transaction_name': 'P SELVAM' },
+    { 'account_name': 'PSK SBI AC', 'account_id': '2afe1683-e05d-442f-ab1b-159d92d1b34e', 'transaction_name': 'SELVAKUMARAN P' },
+    { 'account_name': 'PSS SBI AC', 'account_id': 'f7b7839c-1fb4-429c-8088-441bf01a14a7', 'transaction_name': 'SELVASANKAR P' },
+    { 'account_name': 'Dad SBI AC', 'account_id': '7b58df97-381d-45a4-882e-d8364f793fbc', 'transaction_name': 'PERUMAL R' },
+    { 'account_name': 'Cloudtree AC', 'account_id': 'ca529321-4bf8-430c-aab5-90c333ca34a3', 'transaction_name': 'CLOUDTREE' },
+    { 'account_name': 'PhonePe Wallet', 'account_id': '340ca703-1057-4ce9-a038-730a26d20aea', 'transaction_name': 'PhonePe Wallet' }
+]
 
 # helper funcs
 def find_pdf2txt_cmd():
@@ -278,22 +310,300 @@ def connect_to_postgres():
         logging.exception("Database connection failed")
         return None
 
-def txn_exists(conn, txn_id, utr_no, account_id):
-    # check existence by (account_id, source, external_id) if possible, otherwise by source or external_id
+def txn_exists(conn, txn_id, utr_no, account_id=None):
+    """
+    Safer existence check. Returns True if an entry already exists.
+    If the connection is in a failed transaction state, it will rollback and return False.
+    """
     q_by_both = """
         SELECT EXISTS (
             SELECT 1 FROM entries WHERE account_id = %s AND source = %s AND external_id = %s
-        )
+        );
     """
     q_by_any = "SELECT EXISTS(SELECT 1 FROM entries WHERE source = %s OR external_id = %s);"
-    with conn.cursor() as cur:
-        if account_id and txn_id and utr_no:
-            cur.execute(q_by_both, (account_id, txn_id, utr_no))
-            res = cur.fetchone()[0]
-            if res:
-                return True
-        cur.execute(q_by_any, (txn_id or None, utr_no or None))
-        return cur.fetchone()[0]
+    try:
+        with conn.cursor() as cur:
+            if account_id and txn_id and utr_no:
+                cur.execute(q_by_both, (account_id, txn_id, utr_no))
+                return cur.fetchone()[0]
+            cur.execute(q_by_any, (txn_id or None, utr_no or None))
+            return cur.fetchone()[0]
+    except psycopg2.errors.InFailedSqlTransaction:
+        # connection is aborted due previous error; clear it and continue
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logging.warning("Connection was in failed transaction state; rolled back. Treating txn as not existing.")
+        return False
+    except Exception as e:
+        logging.exception("Error checking txn existence; rolling back and treating as not exists: %s", e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+
+# Example wrapper that shows how to call perform_transfer_advanced safely
+def handle_transfer_call(conn, r, accounts, perform_transfer_fn, self_account_id):
+    try:
+        res = perform_transfer_fn(conn, r, accounts, self_account_id=self_account_id)
+    except Exception as ex:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logging.exception("transfer helper raised unexpected exception; skipping row: %s", ex)
+        return False
+
+    if res.get("status") == "created":
+        logging.info("Transfer created: %s", res)
+        return True  # indicates row handled as transfer
+    elif res.get("status") == "exists":
+        logging.info("Transfer already exists: %s", res)
+        return True
+    elif res.get("status") == "skip":
+        return False
+    else:
+        logging.error("Transfer failed or errored for row; skipping: %s", res)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+
+# def txn_exists(conn, txn_id, utr_no, account_id):
+#     # check existence by (account_id, source, external_id) if possible, otherwise by source or external_id
+#     q_by_both = """
+#         SELECT EXISTS (
+#             SELECT 1 FROM entries WHERE account_id = %s AND source = %s AND external_id = %s
+#         )
+#     """
+#     q_by_any = "SELECT EXISTS(SELECT 1 FROM entries WHERE source = %s OR external_id = %s);"
+#     with conn.cursor() as cur:
+#         if account_id and txn_id and utr_no:
+#             cur.execute(q_by_both, (account_id, txn_id, utr_no))
+#             res = cur.fetchone()[0]
+#             if res:
+#                 return True
+#         cur.execute(q_by_any, (txn_id or None, utr_no or None))
+#         return cur.fetchone()[0]
+
+def perform_transfer(conn, txn, accounts):
+    """
+    Executes a fund transfer between two accounts inside the Sure DB.
+
+    txn: parsed record from your PhonePe importer
+         {
+           "date": "2025-10-22",
+           "time": "18:39",
+           "transaction_id": "T2510221839280379821844",
+           "utr_no": "638914984362",
+           "amount": "-120.00",
+           "name": "Paid to KBSKOFI BARR"
+         }
+
+    accounts: list of dicts
+        [
+          { 'account_name': 'PSM AC', 'account_id': 'uuid', 'transaction_name': 'P SELVAM' },
+          ...
+        ]
+
+    Returns:
+        ("created", outflow_txn_id, inflow_txn_id)
+        ("exists", existing_outflow_id, existing_inflow_id)
+        ("skip", reason)
+    """
+
+    name = (txn.get("name") or "").strip()
+
+    # 1. Does txn match a known account? (Paying SELF or internal account)
+    matched_account = None
+    for acc in accounts:
+        if acc["transaction_name"].lower() in name.lower():
+            matched_account = acc
+            break
+
+    if not matched_account:
+        return ("skip", "no_account_match")
+
+    # The account we sent TO (destination)
+    to_account = matched_account["account_id"]
+    to_account_name = matched_account["account_name"]
+
+    # The account FROM which money is debited (self account)
+    from_account = DEFAULT_SELF_ACCOUNT_ID
+    from_account_name = "PSG SBI AC"
+    if not from_account:
+        return ("skip", "self_account_missing")
+
+    # Prepare schema-friendly values
+    date = txn["date"]
+    created_at = txn["created_at"]
+    updated_at = txn["updated_at"]
+    source_out = txn["transaction_id"]
+    source_in = txn["transaction_id"] + "_IN"
+    external_id = txn["utr_no"]
+    notes = "Imported via PhonePe transfer automation"
+
+    # Convert amount to Decimal
+    from decimal import Decimal
+    amount = Decimal(str(txn["amount"]).replace(",", "").strip())
+    if amount > 0.0:
+        # amount = -amount   # ensure outflow is always negative
+        to_account_name = from_account_name
+        from_account = matched_account["account_id"]
+        from_account_name = matched_account["account_name"]
+        to_account = DEFAULT_SELF_ACCOUNT_ID
+
+    cursor = conn.cursor()
+
+    # 2. Idempotency check — does transfer already exist?
+    # query = f"""
+    #     SELECT outflow_transaction_id, inflow_transaction_id
+    #     FROM transfers
+    #     WHERE
+    #       outflow_transaction_id IN (
+    #             SELECT entryable_id FROM entries WHERE source LIKE "%s")
+    # """ % (source_out)
+    query = """
+           SELECT outflow_transaction_id, inflow_transaction_id
+           FROM transfers
+           WHERE outflow_transaction_id IN (
+               SELECT entryable_id
+               FROM entries
+               WHERE source LIKE %s
+           );
+       """
+
+    cursor.execute(query, (f"%{source_out}%",))
+    row = cursor.fetchone()
+    if row:
+        conn.commit()
+        return ("exists", row[0], row[1])
+
+    # 3. Execute Atomic Transfer
+    try:
+        cursor.execute("BEGIN;")
+
+        # --- Outflow Transaction (debit) ---
+        cursor.execute("""
+            INSERT INTO transactions (created_at, updated_at, kind, external_id)
+            VALUES (%s, %s, 'funds_movement', %s)
+            RETURNING id
+        """, (created_at, updated_at, source_out))
+        out_txn_id = cursor.fetchone()[0]
+
+        # cursor.execute("""
+        #     INSERT INTO entries (
+        #         account_id, entryable_type, entryable_id, amount, currency, date, name,
+        #         created_at, updated_at, notes, locked_attributes, external_id, source
+        #     )
+        #     VALUES (
+        #         %s, 'Transaction', %s, %s, 'INR', %s, %s,
+        #         %s, NOW(), %s, '{}'::jsonb, %s, %s
+        #     )
+        #     RETURNING id
+        # """, (
+        #     from_account, out_txn_id, amount, date, name,
+        #     created_at, updated_at, notes, external_id, source_out
+        # ))
+        cursor.execute("""
+            INSERT INTO entries (
+                account_id, entryable_type, entryable_id, amount, currency, date, name,
+                created_at, updated_at, notes, locked_attributes, external_id, source
+            )
+            VALUES (
+                %s, 'Transaction', %s, %s, 'INR', %s, %s,
+                %s, NOW(), %s, '{}'::jsonb, %s, %s
+            )
+            RETURNING id
+        """, (
+            from_account, out_txn_id, abs(amount), date, 'Transfer to ' + to_account_name,
+            created_at, notes, external_id, source_out
+        ))
+
+
+        # --- Inflow Transaction (credit) ---
+        # cursor.execute("""
+        #     INSERT INTO transactions (created_at, updated_at, kind, external_id)
+        #     VALUES (%s, NOW(), 'funds_movement', %s)
+        #     RETURNING id
+        # """, (created_at, updated_at, source_in))
+        # in_txn_id = cursor.fetchone()[0]
+        #
+        # cursor.execute("""
+        #     INSERT INTO entries (
+        #         account_id, entryable_type, entryable_id, amount, currency, date, name,
+        #         created_at, updated_at, notes, locked_attributes, external_id, source
+        #     )
+        #     VALUES (
+        #         %s, 'Transaction', %s, %s, 'INR', %s, %s,
+        #         %s, NOW(), %s, '{}'::jsonb, %s, %s
+        #     )
+        #     RETURNING id
+        # """, (
+        #     to_account, in_txn_id, amount, date, name,
+        #     created_at, updated_at, notes, external_id, source_in
+        # ))
+        #
+        # # --- Transfer linking ---
+        # cursor.execute("""
+        #     INSERT INTO transfers (outflow_transaction_id, inflow_transaction_id, status, created_at, updated_at)
+        #     VALUES (%s, %s, %s, %s, %s)
+        # """, (out_txn_id, in_txn_id, 'confirmed', created_at, NOW()))
+
+        # import ipdb
+        # ipdb.set_trace()
+        # --- Inflow Transaction (credit) ---
+        # Use both created_at and updated_at as parameters (keeps behaviour consistent)
+        cursor.execute("""
+            INSERT INTO transactions (created_at, updated_at, kind, external_id)
+            VALUES (%s, %s, 'funds_movement', %s)
+            RETURNING id
+        """, (created_at, updated_at, source_in))
+        in_txn_id = cursor.fetchone()[0]
+
+        # --- Inflow entry (credit) ---
+        # Note placeholders count matches tuple length below
+        cursor.execute("""
+            INSERT INTO entries (
+                account_id, entryable_type, entryable_id, amount, currency, date, name,
+                created_at, updated_at, notes, locked_attributes, external_id, source
+            )
+            VALUES (
+                %s, 'Transaction', %s, %s, 'INR', %s, %s,
+                %s, %s, %s, '{}', %s, %s
+            )
+            RETURNING id
+        """, (
+            to_account,      # account_id
+            in_txn_id,       # entryable_id
+            -amount,          # amount (positive)
+            date,            # date
+            'Transfer from ' + from_account_name,            # name
+            created_at,      # created_at
+            updated_at,      # updated_at  <-- replaced NOW() with placeholder
+            notes,           # notes
+            external_id,     # external_id (UTR)
+            source_in        # source
+        ))
+
+        # --- Transfer linking ---
+        # Use placeholders for both created_at and updated_at (no SQL function in params)
+        cursor.execute("""
+            INSERT INTO transfers (outflow_transaction_id, inflow_transaction_id, status, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (out_txn_id, in_txn_id, 'confirmed', created_at, updated_at))
+
+
+        cursor.execute("COMMIT;")
+
+        return ("created", out_txn_id, in_txn_id)
+
+    except Exception as e:
+        cursor.execute("ROLLBACK;")
+        return ("error", str(e))
 
 def insert_transactions(conn, records, min_date=None, dry_run=False):
     inserted = 0
@@ -339,29 +649,48 @@ def insert_transactions(conn, records, min_date=None, dry_run=False):
                 to_write.append({**row, "source": row["source"], "external_id": row["external_id"]})
                 continue
             try:
+                is_transfer = perform_transfer(conn, r, accounts)
+
+                if is_transfer[0] == "created":
+                    print("Transfer inserted:", is_transfer)
+                    continue
+
+                elif is_transfer[0] == "exists":
+                    print("Transfer already exists:", is_transfer)
+                    continue
+
+                elif is_transfer[0] == "skip":
+                    print("Detected as normal expense")
+                    continue
+                    # not a transfer → let normal importer handle
+
+                    # handle as normal expense (not a transfer)
+                    cur.execute("""
+                        INSERT INTO transactions (created_at, updated_at, category_id, merchant_id, locked_attributes, kind, external_id)
+                        VALUES (%s, %s, NULL, NULL, '{}', 'standard', %s)
+                        RETURNING id
+                    """, (row["created_at"], NOW(), row["source"]))
+                    trans_id = cur.fetchone()[0]
+                    # insert entry: must supply account_id (not null) and name (not null)
+                    cur.execute("""
+                        INSERT INTO entries (
+                            account_id, entryable_type, entryable_id, amount, currency, date, name,
+                            created_at, updated_at, import_id, notes, excluded, plaid_id, locked_attributes, external_id, source
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, false, NULL, '{}', %s, %s)
+                        RETURNING id
+                    """, (
+                        self_account, 'Transaction', trans_id,
+                        row["amount"], 'INR', row["date"], row["name"],
+                        row["created_at"], NOW(), 'Added via automation-script', row["external_id"], row["source"]
+                    ))
+                    entry_id = cur.fetchone()[0]
+                    conn.commit()
+                    inserted += 1
+                    logging.info("Inserted entry id=%s trans=%s amount=%s", entry_id, trans_id, row["amount"])
+                else:
+                    logging.error("Transfer failed: %s", row)
+                # accounts = your list of dicts (from config)
                 # insert transactions row, set external_id to source (optional) so you can refer later
-                cur.execute("""
-                    INSERT INTO transactions (created_at, updated_at, category_id, merchant_id, locked_attributes, kind, external_id)
-                    VALUES (%s, %s, NULL, NULL, '{}', 'standard', %s)
-                    RETURNING id
-                """, (row["created_at"], row["updated_at"], row["source"]))
-                trans_id = cur.fetchone()[0]
-                # insert entry: must supply account_id (not null) and name (not null)
-                cur.execute("""
-                    INSERT INTO entries (
-                        account_id, entryable_type, entryable_id, amount, currency, date, name,
-                        created_at, updated_at, import_id, notes, excluded, plaid_id, locked_attributes, external_id, source
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, false, NULL, '{}', %s, %s)
-                    RETURNING id
-                """, (
-                    self_account, 'Transaction', trans_id,
-                    row["amount"], 'INR', row["date"], row["name"],
-                    row["created_at"], row["updated_at"], 'Added via automation-script', row["external_id"], row["source"]
-                ))
-                entry_id = cur.fetchone()[0]
-                conn.commit()
-                inserted += 1
-                logging.info("Inserted entry id=%s trans=%s amount=%s", entry_id, trans_id, row["amount"])
             except Exception:
                 conn.rollback()
                 logging.exception("Failed to insert row: %s", row)
@@ -423,3 +752,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
