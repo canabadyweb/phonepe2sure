@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 """
-phonepe_expense_update_cleaned.py
+phonepe_expense_update_with_masks_v3.py
 
-Cleaner, safer version of your PhonePe -> Sure DB importer.
-Based on your uploaded script. See original for more context. :contentReference[oaicite:1]{index=1}
+PhonePe importer that:
+ - extracts masked mobile(s) from PDF header and attaches linked_mobile_number to records
+ - looks up merchant/transfer target accounts by matching `accounts.locked_attributes->>'account_name'`
+   against the parsed transaction `name` (case-insensitive, substring match)
+ - looks up the SELF account per-record by matching `accounts.locked_attributes->>'mobile'`
+   to the parsed `linked_mobile_number` (exact match, tries with/without leading +)
+ - falls back to SURE_SELF_ACCOUNT_ID env or DEFAULT_SELF_ACCOUNT_ID if lookup fails
 
-Usage:
-  pip install python-dotenv psycopg2-binary PyPDF2 pdfminer.six
-  python phonepe_expense_update_cleaned.py input.pdf|input.txt [--min-date=YYYY-MM-DD] [--dry-run]
+Place this file in the same environment as your original script and run:
+  python phonepe_expense_update_with_masks_v3.py /path/to/statement.pdf [--min-date=YYYY-MM-DD] [--dry-run]
+
+Based on your previous script. See original uploaded file for reference. fileciteturn3file0
 """
-
 from __future__ import annotations
 
 import csv
 import getpass
+import json
 import logging
 import os
 import re
@@ -24,16 +30,17 @@ import sys
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, getcontext
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Iterable
 
 import psycopg2
+import psycopg2.extras
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader, PdfWriter
 
 # Decimal precision
 getcontext().prec = 28
 
-# Logging (file + console)
+# Logging
 LOG_FILE = os.path.abspath("phonepe_debug.log")
 root_logger = logging.getLogger()
 for h in list(root_logger.handlers):
@@ -51,7 +58,7 @@ root_logger.setLevel(logging.DEBUG)
 logger = logging.getLogger(__name__)
 logger.info("Logging initialized. Writing to %s", LOG_FILE)
 
-# Regexes (kept from original)
+# Regexes
 DATE_FIND_RE = re.compile(
     r'([A-Za-z]{3,9}\s*\d{1,2},\s*\d{4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}-\d{1,2}-\d{1,2})'
 )
@@ -66,18 +73,9 @@ HEADER_KEYWORDS = ["date transaction details", "transaction details", "date tran
 
 DEFAULT_SELF_ACCOUNT_ID = os.getenv("SURE_SELF_ACCOUNT_ID", "54f3d108-9ed2-446c-a489-ed1c2ffdf5b0")
 
-# keep your account map (unchanged)
-ACCOUNTS = [
-    {"account_name": "PSG SBI AC", "account_id": "54f3d108-9ed2-446c-a489-ed1c2ffdf5b0", "transaction_name": "SELF"},
-    {"account_name": "PSM AC", "account_id": "927a3ee1-3963-4ebf-97cd-137910e155c3", "transaction_name": "P SELVAM"},
-    {"account_name": "PSK SBI AC", "account_id": "2afe1683-e05d-442f-ab1b-159d92d1b34e", "transaction_name": "SELVAKUMARAN P"},
-    {"account_name": "PSS SBI AC", "account_id": "f7b7839c-1fb4-429c-8088-441bf01a14a7", "transaction_name": "SELVASANKAR P"},
-    {"account_name": "Dad SBI AC", "account_id": "7b58df97-381d-45a4-882e-d8364f793fbc", "transaction_name": "PERUMAL R"},
-    {"account_name": "Cloudtree AC", "account_id": "ca529321-4bf8-430c-aab5-90c333ca34a3", "transaction_name": "CLOUDTREE"},
-    {"account_name": "PhonePe Wallet", "account_id": "340ca703-1057-4ce9-a038-730a26d20aea", "transaction_name": "PhonePe Wallet"},
-]
-
-
+# ----------------------
+# Utilities & parsing
+# ----------------------
 def find_pdf2txt_cmd() -> Optional[str]:
     for name in ("pdf2txt.py", "pdf2txt"):
         p = shutil.which(name)
@@ -306,7 +304,56 @@ def parse_txt_file(path: Path) -> List[Dict]:
     return parse_pdf2txt_lines(lines)
 
 
-# DB helpers
+def extract_masked_mobiles_from_pdf(pdf_path: Path) -> List[str]:
+    try:
+        reader = PdfReader(str(pdf_path))
+        if not reader.pages:
+            return []
+        first_page = reader.pages[0]
+        text = first_page.extract_text() or ""
+
+        pat_full = re.compile(r"\+\d{11,13}")
+        pat_masked = re.compile(r"\+\s*[0-9Xx\-\s]{6,}\d{2,4}", re.IGNORECASE)
+
+        found = []
+        for m in pat_full.finditer(text):
+            s = m.group(0)
+            s = re.sub(r"[^\d\+]", "", s)
+            if s not in found:
+                found.append(s)
+
+        for m in pat_masked.finditer(text):
+            s = m.group(0)
+            s = re.sub(r"[ \-]", "", s)
+            if s not in found:
+                found.append(s)
+
+        found = [re.sub(r"x", "X", f, flags=re.IGNORECASE) for f in found]
+        return found
+    except Exception:
+        logger.exception("Failed extracting masked mobiles from PDF header")
+        return []
+
+
+def find_mask_in_text(block_text: str, masks: Iterable[str]) -> Optional[str]:
+    if not block_text or not masks:
+        return None
+    low = block_text.lower()
+    for m in masks:
+        cmp_m = m.lower().replace("-", "").replace(" ", "")
+        if cmp_m in re.sub(r"[ \-]", "", low):
+            return m
+    for m in masks:
+        tail = re.search(r"(\d{3,4})$", m)
+        if tail:
+            t = tail.group(1)
+            if re.search(r"\b" + re.escape(t) + r"\b", block_text):
+                return m
+    return None
+
+# ----------------------
+# DB helpers: lookup by mobile and by account_name in locked_attributes
+# ----------------------
 def connect_to_postgres():
     load_dotenv()
     host = os.getenv("SURE_DB_HOST") or os.getenv("DB_HOST") or "localhost"
@@ -323,6 +370,61 @@ def connect_to_postgres():
     except Exception:
         logger.exception("Database connection failed")
         return None
+
+
+def lookup_self_account_by_mobile(conn, mask: Optional[str]) -> Optional[str]:
+    """
+    Find account.id where locked_attributes->>'mobile' = mask (tries with and without leading +).
+    """
+    if not mask:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,name FROM accounts WHERE locked_attributes->>'mobile' = %s LIMIT 1",
+                (mask,),
+            )
+            row = cur.fetchone()
+            if row:
+                return (row[0],row[1])
+            # try without '+'
+            if mask.startswith("+"):
+                cur.execute(
+                    "SELECT id,name FROM accounts WHERE locked_attributes->>'mobile' = %s LIMIT 1",
+                    (mask.lstrip("+"),),
+                )
+                row2 = cur.fetchone()
+                if row2:
+                    return (row2[0],row2[1])
+    except Exception:
+        logger.exception("lookup_self_account_by_mobile failed")
+    return None
+
+
+def lookup_account_by_name(conn, name: str) -> Optional[Dict]:
+    """
+    Lookup accounts table for a record whose locked_attributes->>'account_name' loosely matches `name`.
+    Returns a dict with account id and account_name if found, otherwise None.
+
+    Uses case-insensitive substring match via ILIKE.
+    """
+    if not name:
+        return None
+    try:
+        with conn.cursor() as cur:
+            # pattern = f"%{name.strip().lower()}%"
+            pattern = f"{name.strip().lower()}"
+            # Use lower(...) comparison for portability
+            cur.execute(
+                "SELECT id, locked_attributes->>'account_name' AS account_name FROM accounts WHERE lower(locked_attributes->>'account_name') LIKE %s LIMIT 1",
+                (pattern,),
+            )
+            row = cur.fetchone()
+            if row:
+                return {"account_id": row[0], "account_name": row[1] or ""}
+    except Exception:
+        logger.exception("lookup_account_by_name failed")
+    return None
 
 
 def txn_exists(conn, txn_id: Optional[str], utr_no: Optional[str], account_id: Optional[str] = None) -> bool:
@@ -355,42 +457,28 @@ def txn_exists(conn, txn_id: Optional[str], utr_no: Optional[str], account_id: O
         return False
 
 
-def find_account_match_by_name(name: str):
-    if not name:
-        return None
-    nl = name.lower()
-    for acc in ACCOUNTS:
-        if acc["transaction_name"].lower() in nl:
-            return acc
-    return None
-
-
-def perform_transfer(conn, txn: Dict, accounts: List[Dict]) -> Tuple[str, Optional[int], Optional[int]]:
+def perform_transfer(conn, txn: Dict, self_account: Tuple[str, str]) -> Tuple[str, Optional[int], Optional[int]]:
     """
-    Returns:
-      ("created", outflow_txn_id, inflow_txn_id)
-      ("exists", outflow_txn_id, inflow_txn_id)
-      ("skip", reason, None)
-      ("error", error_msg, None)
+    Attempt to treat the transaction as an internal transfer by matching the payee name to an
+    account stored in accounts.locked_attributes->>'account_name'. Uses self_account_id as the 'from' account.
+    Returns ("created"/"exists"/"skip"/"error", outflow_txn_id, inflow_txn_id)
     """
     name = (txn.get("name") or "").strip()
-    matched = find_account_match_by_name(name)
+    matched = lookup_account_by_name(conn, name)
     if not matched:
         return ("skip", None, None)
 
     to_account = matched["account_id"]
     to_name = matched["account_name"]
-    from_account = DEFAULT_SELF_ACCOUNT_ID
-    from_name = "SELF_ACCOUNT"
+    from_account = self_account[0] or os.getenv("SURE_SELF_ACCOUNT_ID") or DEFAULT_SELF_ACCOUNT_ID
+    from_name = self_account[1]
 
-    # parse amount as Decimal
     amt = safe_decimal(txn.get("amount"))
     if amt is None:
         return ("skip", None, None)
 
-    # if positive amount means money came IN to self, flip from/to
     if amt > Decimal("0"):
-        # treat as incoming -> swap
+        # incoming to self -> swap
         tmp_id, tmp_name = to_account, to_name
         to_account, to_name = from_account, from_name
         from_account, from_name = tmp_id, tmp_name
@@ -399,7 +487,6 @@ def perform_transfer(conn, txn: Dict, accounts: List[Dict]) -> Tuple[str, Option
     source_in = f"{source_out}_IN"
     external_id = txn.get("utr_no")
 
-    # idempotency: if transfers already present by source_out OR both external ids
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -417,18 +504,15 @@ def perform_transfer(conn, txn: Dict, accounts: List[Dict]) -> Tuple[str, Option
                 conn.commit()
                 return ("exists", row[0], row[1])
 
-            # begin atomic
             cur.execute("BEGIN;")
 
-            # outflow transaction
             cur.execute(
                 "INSERT INTO transactions (created_at, updated_at, kind, external_id) VALUES (%s, %s, 'funds_movement', %s) RETURNING id",
                 (txn["created_at"], txn["updated_at"], source_out),
             )
             out_txn_id = cur.fetchone()[0]
 
-            # outflow entry: amount should be negative for outflow
-            out_amount = abs(amt)
+            out_amount = -amt
             cur.execute(
                 """
                 INSERT INTO entries (
@@ -451,15 +535,13 @@ def perform_transfer(conn, txn: Dict, accounts: List[Dict]) -> Tuple[str, Option
                 ),
             )
 
-            # inflow transaction
             cur.execute(
                 "INSERT INTO transactions (created_at, updated_at, kind, external_id) VALUES (%s, %s, 'funds_movement', %s) RETURNING id",
                 (txn["created_at"], txn["updated_at"], source_in),
             )
             in_txn_id = cur.fetchone()[0]
+            in_amount = amt
 
-            # inflow entry (positive)
-            in_amount = -abs(amt)
             cur.execute(
                 """
                 INSERT INTO entries (
@@ -482,7 +564,6 @@ def perform_transfer(conn, txn: Dict, accounts: List[Dict]) -> Tuple[str, Option
                 ),
             )
 
-            # link transfer
             cur.execute(
                 "INSERT INTO transfers (outflow_transaction_id, inflow_transaction_id, status, created_at, updated_at) VALUES (%s, %s, %s, %s, %s)",
                 (out_txn_id, in_txn_id, "confirmed", txn["created_at"], txn["updated_at"]),
@@ -502,8 +583,6 @@ def perform_transfer(conn, txn: Dict, accounts: List[Dict]) -> Tuple[str, Option
 def insert_transactions(conn, records: List[Dict], min_date=None, dry_run=False) -> int:
     inserted = 0
     dry_rows = []
-    self_account = os.getenv("SURE_SELF_ACCOUNT_ID") or DEFAULT_SELF_ACCOUNT_ID
-    print(records)
 
     try:
         for r in records:
@@ -519,9 +598,17 @@ def insert_transactions(conn, records: List[Dict], min_date=None, dry_run=False)
             if min_date and txn_date < min_date:
                 continue
 
+            # Resolve self account by linked_mobile_number (primary) then fallback to env/default
+            self_account = None
+            if r.get("linked_mobile_number"):
+                self_account_id, self_account_name = lookup_self_account_by_mobile(conn, r.get("linked_mobile_number"))
+            if not self_account_id:
+                self_account_id = os.getenv("SURE_SELF_ACCOUNT_ID") or DEFAULT_SELF_ACCOUNT_ID
+                self_account_name = "SELF_ACCOUNT"
+
             exists = txn_exists(conn, r.get("transaction_id"), r.get("utr_no"), self_account)
             if exists:
-                logger.info("Already exists, skipping: source=%s external_id=%s", r.get("transaction_id"), r.get("utr_no"))
+                logger.info("Already exists, skipping: source=%s external_id=%s account=%s", r.get("transaction_id"), r.get("utr_no"), self_account)
                 continue
 
             amt_dec = safe_decimal(r.get("amount"))
@@ -529,8 +616,8 @@ def insert_transactions(conn, records: List[Dict], min_date=None, dry_run=False)
                 logger.warning("Invalid amount, skipping: %s", r)
                 continue
 
-            # First, try treating it as a transfer (internal account match)
-            transfer_result = perform_transfer(conn, r, ACCOUNTS)
+            # Try internal transfer using DB-based account lookup
+            transfer_result = perform_transfer(conn, r, (self_account_id,self_account_name))
             if transfer_result[0] == "created":
                 logger.info("Inserted transfer for source=%s", r.get("transaction_id"))
                 continue
@@ -539,17 +626,24 @@ def insert_transactions(conn, records: List[Dict], min_date=None, dry_run=False)
                 continue
             elif transfer_result[0] == "error":
                 logger.error("Transfer error, will try as expense: %s", transfer_result[1])
-                # fall through to expense handling
 
             # Normal expense insertion path
+            locked_attrs = {}
+            if r.get("linked_mobile_number"):
+                locked_attrs["mobile"] = r.get("linked_mobile_number")
+            locked_attrs["parser_version"] = "phonepe-v3"
+
             row = {
                 "created_at": r["created_at"],
                 "updated_at": r["updated_at"],
                 "date": r["date"],
                 "name": r.get("name") or "PhonePe",
-                "amount": -amt_dec,
+                "amount": amt_dec,
                 "external_id": r.get("utr_no"),
                 "source": r.get("transaction_id"),
+                "linked_mobile_number": r.get("linked_mobile_number"),
+                "self_account": self_account,
+                "locked_attributes": locked_attrs,
             }
 
             if dry_run:
@@ -561,10 +655,10 @@ def insert_transactions(conn, records: List[Dict], min_date=None, dry_run=False)
                     cur.execute(
                         """
                         INSERT INTO transactions (created_at, updated_at, category_id, merchant_id, locked_attributes, kind, external_id)
-                        VALUES (%s, %s, NULL, NULL, '{}'::jsonb, 'standard', %s)
+                        VALUES (%s, %s, NULL, NULL, %s::jsonb, 'standard', %s)
                         RETURNING id
                         """,
-                        (row["created_at"], row["updated_at"], row["source"]),
+                        (row["created_at"], row["updated_at"], json.dumps(row["locked_attributes"]), row["source"]),
                     )
                     trans_id = cur.fetchone()[0]
 
@@ -573,11 +667,11 @@ def insert_transactions(conn, records: List[Dict], min_date=None, dry_run=False)
                         INSERT INTO entries (
                             account_id, entryable_type, entryable_id, amount, currency, date, name,
                             created_at, updated_at, import_id, notes, excluded, plaid_id, locked_attributes, external_id, source
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, false, NULL, '{}'::jsonb, %s, %s)
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, false, NULL, %s::jsonb, %s, %s)
                         RETURNING id
                         """,
                         (
-                            self_account,
+                            row["self_account"],
                             "Transaction",
                             trans_id,
                             row["amount"],
@@ -587,6 +681,7 @@ def insert_transactions(conn, records: List[Dict], min_date=None, dry_run=False)
                             row["created_at"],
                             row["updated_at"],
                             "Added via automation-script",
+                            json.dumps(row["locked_attributes"]),
                             row["external_id"],
                             row["source"],
                         ),
@@ -594,7 +689,7 @@ def insert_transactions(conn, records: List[Dict], min_date=None, dry_run=False)
                     entry_id = cur.fetchone()[0]
                     conn.commit()
                     inserted += 1
-                    logger.info("Inserted expense entry id=%s trans=%s amount=%s", entry_id, trans_id, row["amount"])
+                    logger.info("Inserted expense entry id=%s trans=%s amount=%s account=%s mask=%s", entry_id, trans_id, row["amount"], row["self_account"], row.get("linked_mobile_number"))
             except Exception:
                 try:
                     conn.rollback()
@@ -602,6 +697,8 @@ def insert_transactions(conn, records: List[Dict], min_date=None, dry_run=False)
                     pass
                 logger.exception("Failed to insert expense row: %s", row)
                 continue
+    except Exception:
+        logger.exception("Exception arise")
     finally:
         pass
 
@@ -616,10 +713,9 @@ def insert_transactions(conn, records: List[Dict], min_date=None, dry_run=False)
     logger.info("Done. Inserted %d new expense rows", inserted)
     return inserted
 
-
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python phonepe_expense_update_cleaned.py input.pdf|input.txt [--min-date=YYYY-MM-DD] [--dry-run]")
+        print("Usage: python phonepe_expense_update_with_masks_v3.py input.pdf|input.txt [--min-date=YYYY-MM-DD] [--dry-run]")
         return
 
     inp = Path(sys.argv[1])
@@ -637,32 +733,65 @@ def main():
         else:
             logger.warning("Unknown argument passed: %s", a)
 
+    masks: List[str] = []
+    parsed: List[Dict] = []
+
     if inp.suffix.lower() == ".pdf":
         pdf_to_parse = decrypt_pdf_if_needed(inp)
+        masks = extract_masked_mobiles_from_pdf(pdf_to_parse)
+        logger.info("Found masked mobiles on page1: %s", masks)
+
         tmp = Path(tempfile.NamedTemporaryFile(delete=False, suffix=".txt").name)
         try:
             run_pdf2txt(pdf_to_parse, tmp)
-            records = parse_txt_file(tmp)
+            parsed = parse_txt_file(tmp)
         finally:
             try:
                 tmp.unlink(missing_ok=True)
             except Exception:
                 pass
     else:
-        records = parse_txt_file(inp)
+        parsed = parse_txt_file(inp)
+        try:
+            with open(inp, "r", encoding="utf-8", errors="ignore") as fh:
+                head_lines = [next(fh) for _ in range(200)]
+            head = "".join(head_lines)
+        except Exception:
+            head = ""
+        masks = re.findall(r"\+\s*(?:X|x|\d|[\s-]){6,}\d{2,4}", head)
+        masks = [re.sub(r"[ \-]", "", m) for m in masks]
+        masks = [re.sub(r"x", "X", f, flags=re.IGNORECASE) for f in masks]
 
-    logger.info("Parsed %d records", len(records))
+    # attach linked_mobile_number metadata to records
+    default_mask = masks[0] if len(masks) == 1 else None
+    for rec in parsed:
+        if default_mask:
+            rec["linked_mobile_number"] = default_mask
+        else:
+            block_text = " ".join([str(rec.get(k) or "") for k in ("name", "transaction_id", "utr_no")])
+            rec["linked_mobile_number"] = find_mask_in_text(block_text, masks)
+
+    logger.info("Parsed %d records and attached linked_mobile_number metadata", len(parsed))
+
     conn = connect_to_postgres()
     if not conn:
+        # self_account = lookup_self_account_by_mobile(conn, parsed[0].get("linked_mobile_number"))
+        # print(f"self_account={self_account}")
         logger.error("DB connection failed; abort")
+        if parsed:
+            out_path = Path("phonepe_parsed_records.json")
+            try:
+                Path(out_path).write_text(json.dumps(parsed, indent=2, ensure_ascii=False), encoding="utf-8")
+                logger.info("Wrote parsed records to %s for inspection", out_path)
+            except Exception:
+                pass
         return
 
     try:
-        inserted = insert_transactions(conn, records, min_date=min_date, dry_run=dry_run)
+        inserted = insert_transactions(conn, parsed, min_date=min_date, dry_run=dry_run)
         logger.info("Inserted %d rows", inserted)
     finally:
         conn.close()
-
 
 if __name__ == "__main__":
     main()
