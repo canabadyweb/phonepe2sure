@@ -36,6 +36,7 @@ import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader, PdfWriter
+import requests
 
 # Decimal precision
 getcontext().prec = 28
@@ -599,16 +600,16 @@ def insert_transactions(conn, records: List[Dict], min_date=None, dry_run=False)
                 continue
 
             # Resolve self account by linked_mobile_number (primary) then fallback to env/default
-            self_account = None
+            (self_account_id, self_account_name) = (None, None)
             if r.get("linked_mobile_number"):
                 self_account_id, self_account_name = lookup_self_account_by_mobile(conn, r.get("linked_mobile_number"))
             if not self_account_id:
                 self_account_id = os.getenv("SURE_SELF_ACCOUNT_ID") or DEFAULT_SELF_ACCOUNT_ID
                 self_account_name = "SELF_ACCOUNT"
 
-            exists = txn_exists(conn, r.get("transaction_id"), r.get("utr_no"), self_account)
+            exists = txn_exists(conn, r.get("transaction_id"), r.get("utr_no"), self_account_id)
             if exists:
-                logger.info("Already exists, skipping: source=%s external_id=%s account=%s", r.get("transaction_id"), r.get("utr_no"), self_account)
+                logger.info("Already exists, skipping: source=%s external_id=%s account=%s", r.get("transaction_id"), r.get("utr_no"), self_account_id)
                 continue
 
             amt_dec = safe_decimal(r.get("amount"))
@@ -638,11 +639,11 @@ def insert_transactions(conn, records: List[Dict], min_date=None, dry_run=False)
                 "updated_at": r["updated_at"],
                 "date": r["date"],
                 "name": r.get("name") or "PhonePe",
-                "amount": amt_dec,
+                "amount": abs(amt_dec),
                 "external_id": r.get("utr_no"),
                 "source": r.get("transaction_id"),
                 "linked_mobile_number": r.get("linked_mobile_number"),
-                "self_account": self_account,
+                "self_account_id": self_account_id,
                 "locked_attributes": locked_attrs,
             }
 
@@ -671,7 +672,7 @@ def insert_transactions(conn, records: List[Dict], min_date=None, dry_run=False)
                         RETURNING id
                         """,
                         (
-                            row["self_account"],
+                            row["self_account_id"],
                             "Transaction",
                             trans_id,
                             row["amount"],
@@ -689,7 +690,7 @@ def insert_transactions(conn, records: List[Dict], min_date=None, dry_run=False)
                     entry_id = cur.fetchone()[0]
                     conn.commit()
                     inserted += 1
-                    logger.info("Inserted expense entry id=%s trans=%s amount=%s account=%s mask=%s", entry_id, trans_id, row["amount"], row["self_account"], row.get("linked_mobile_number"))
+                    logger.info("Inserted expense entry id=%s trans=%s amount=%s account=%s mask=%s", entry_id, trans_id, row["amount"], row["self_account_id"], row.get("linked_mobile_number"))
             except Exception:
                 try:
                     conn.rollback()
