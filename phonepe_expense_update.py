@@ -72,7 +72,107 @@ DEBIT_WORD_RE = re.compile(r'\bDebit\b', re.IGNORECASE)
 CREDIT_WORD_RE = re.compile(r'\bCredit\b', re.IGNORECASE)
 HEADER_KEYWORDS = ["date transaction details", "transaction details", "date transaction details type amount"]
 
+# Load from .env
+load_dotenv()
 DEFAULT_SELF_ACCOUNT_ID = os.getenv("SURE_SELF_ACCOUNT_ID", "54f3d108-9ed2-446c-a489-ed1c2ffdf5b0")
+DEFAULT_API_ENDPOINT = os.getenv("API_ENDPOINT", "http://localhost:3030")
+API_KEY = os.getenv("API_KEY", None)
+
+# logger.info("Using API_KEY=%s for %s", API_KEY, DEFAULT_API_ENDPOINT)
+
+# ----------------------
+# Account Balance checking
+# ----------------------
+def parse_balance_string(balance_str: str) -> Decimal:
+    """
+    Convert a balance string like "₹1,300.19" or "Rs. 1,300.19" or "-₹1,200.50" to Decimal(1300.19).
+    Will raise ValueError if parsing fails.
+    """
+    if balance_str is None:
+        raise ValueError("balance_str is None")
+    # Remove currency characters and non-numeric punctuation but keep minus and dot
+    cleaned = re.sub(r"[^\d\.\-]", "", str(balance_str))
+    # Edge: strings like "" or "-" -> invalid
+    if cleaned in ("", "-", "."):
+        raise ValueError(f"Cannot parse balance from '{balance_str}' (cleaned='{cleaned}')")
+    try:
+        return Decimal(cleaned)
+    except InvalidOperation as exc:
+        raise ValueError(f"Invalid numeric value extracted from '{balance_str}': {cleaned}") from exc
+
+
+def get_account_balance(
+    account_id: Optional[str] = None,
+    account_name: Optional[str] = None,
+    api_base_url: Optional[str] = DEFAULT_API_ENDPOINT,
+    api_key: Optional[str] = API_KEY,
+    bearer_token: Optional[str] = None,
+    timeout: int = 10
+) -> Decimal:
+    """
+    Query GET {api_base_url.rstrip('/')}/api/v1/accounts and return the Decimal balance for the matched account.
+
+    Either account_id or account_name must be provided. account_id takes precedence when both are given.
+
+    Args:
+      api_base_url: base URL for the Sure API (scheme + host[:port], e.g. "http://localhost:3030")
+      account_id: UUID of account to match (exact)
+      account_name: fallback: account name to match (case-insensitive substring)
+      api_key: optional API key to send as X-Api-Key header
+      bearer_token: optional Bearer token (Authorization header)
+      timeout: request timeout seconds
+
+    Returns:
+      Decimal balance (numeric)
+
+    Raises:
+      RuntimeError on network / HTTP error
+      ValueError if account not found or balance cannot be parsed
+    """
+    if not (account_id or account_name):
+        raise ValueError("Provide account_id or account_name to locate the account")
+
+    url = f"{api_base_url.rstrip('/')}/api/v1/accounts"
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["X-Api-Key"] = api_key
+    if bearer_token:
+        headers["Authorization"] = f"Bearer {bearer_token}"
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=timeout)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to call {url}: {exc}") from exc
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"Bad response from {url}: {resp.status_code} {resp.text}")
+
+    payload = resp.json()
+    accounts = payload.get("accounts") or []
+
+    # match by id first; else by name substring (case-insensitive)
+    match = None
+    if account_id:
+        for a in accounts:
+            if str(a.get("id")) == str(account_id):
+                match = a
+                break
+    if match is None and account_name:
+        low = account_name.strip().lower()
+        for a in accounts:
+            nm = (a.get("name") or "").lower()
+            if low in nm:
+                match = a
+                break
+
+    if match is None:
+        raise ValueError(f"Account not found for id='{account_id}' name='{account_name}'")
+
+    balance_str = match.get("balance")
+    if balance_str is None:
+        raise ValueError(f"Account payload missing 'balance' field: {match}")
+
+    return parse_balance_string(balance_str)
 
 # ----------------------
 # Utilities & parsing
@@ -356,7 +456,6 @@ def find_mask_in_text(block_text: str, masks: Iterable[str]) -> Optional[str]:
 # DB helpers: lookup by mobile and by account_name in locked_attributes
 # ----------------------
 def connect_to_postgres():
-    load_dotenv()
     host = os.getenv("SURE_DB_HOST") or os.getenv("DB_HOST") or "localhost"
     port = int(os.getenv("SURE_DB_PORT") or os.getenv("DB_PORT") or 5432)
     db = os.getenv("SURE_DB_NAME") or os.getenv("DB_NAME")
@@ -712,7 +811,8 @@ def insert_transactions(conn, records: List[Dict], min_date=None, dry_run=False)
         logger.info("Dry-run CSV written to %s (%d rows)", out_path, len(dry_rows))
 
     logger.info("Done. Inserted %d new expense rows", inserted)
-    return inserted
+    status = {"account_id": self_account_id, "account_name": self_account_name, "inserted" : inserted}
+    return status
 
 def main():
     if len(sys.argv) < 2:
@@ -789,8 +889,10 @@ def main():
         return
 
     try:
-        inserted = insert_transactions(conn, parsed, min_date=min_date, dry_run=dry_run)
-        logger.info("Inserted %d rows", inserted)
+        status = insert_transactions(conn, parsed, min_date=min_date, dry_run=dry_run)
+        logger.info("Inserted %d rows", status["inserted"])
+        balance = get_account_balance(account_id=status["account_id"])
+        logger.info("Balance for '%s'=%s", status["account_name"], balance)
     finally:
         conn.close()
 
