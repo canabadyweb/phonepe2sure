@@ -36,7 +36,6 @@ import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader, PdfWriter
-import requests
 
 # Decimal precision
 getcontext().prec = 28
@@ -72,107 +71,7 @@ DEBIT_WORD_RE = re.compile(r'\bDebit\b', re.IGNORECASE)
 CREDIT_WORD_RE = re.compile(r'\bCredit\b', re.IGNORECASE)
 HEADER_KEYWORDS = ["date transaction details", "transaction details", "date transaction details type amount"]
 
-# Load from .env
-load_dotenv()
 DEFAULT_SELF_ACCOUNT_ID = os.getenv("SURE_SELF_ACCOUNT_ID", "54f3d108-9ed2-446c-a489-ed1c2ffdf5b0")
-DEFAULT_API_ENDPOINT = os.getenv("API_ENDPOINT", "http://localhost:3030")
-API_KEY = os.getenv("API_KEY", None)
-
-# logger.info("Using API_KEY=%s for %s", API_KEY, DEFAULT_API_ENDPOINT)
-
-# ----------------------
-# Account Balance checking
-# ----------------------
-def parse_balance_string(balance_str: str) -> Decimal:
-    """
-    Convert a balance string like "₹1,300.19" or "Rs. 1,300.19" or "-₹1,200.50" to Decimal(1300.19).
-    Will raise ValueError if parsing fails.
-    """
-    if balance_str is None:
-        raise ValueError("balance_str is None")
-    # Remove currency characters and non-numeric punctuation but keep minus and dot
-    cleaned = re.sub(r"[^\d\.\-]", "", str(balance_str))
-    # Edge: strings like "" or "-" -> invalid
-    if cleaned in ("", "-", "."):
-        raise ValueError(f"Cannot parse balance from '{balance_str}' (cleaned='{cleaned}')")
-    try:
-        return Decimal(cleaned)
-    except InvalidOperation as exc:
-        raise ValueError(f"Invalid numeric value extracted from '{balance_str}': {cleaned}") from exc
-
-
-def get_account_balance(
-    account_id: Optional[str] = None,
-    account_name: Optional[str] = None,
-    api_base_url: Optional[str] = DEFAULT_API_ENDPOINT,
-    api_key: Optional[str] = API_KEY,
-    bearer_token: Optional[str] = None,
-    timeout: int = 10
-) -> Decimal:
-    """
-    Query GET {api_base_url.rstrip('/')}/api/v1/accounts and return the Decimal balance for the matched account.
-
-    Either account_id or account_name must be provided. account_id takes precedence when both are given.
-
-    Args:
-      api_base_url: base URL for the Sure API (scheme + host[:port], e.g. "http://localhost:3030")
-      account_id: UUID of account to match (exact)
-      account_name: fallback: account name to match (case-insensitive substring)
-      api_key: optional API key to send as X-Api-Key header
-      bearer_token: optional Bearer token (Authorization header)
-      timeout: request timeout seconds
-
-    Returns:
-      Decimal balance (numeric)
-
-    Raises:
-      RuntimeError on network / HTTP error
-      ValueError if account not found or balance cannot be parsed
-    """
-    if not (account_id or account_name):
-        raise ValueError("Provide account_id or account_name to locate the account")
-
-    url = f"{api_base_url.rstrip('/')}/api/v1/accounts"
-    headers = {"Accept": "application/json"}
-    if api_key:
-        headers["X-Api-Key"] = api_key
-    if bearer_token:
-        headers["Authorization"] = f"Bearer {bearer_token}"
-
-    try:
-        resp = requests.get(url, headers=headers, timeout=timeout)
-    except Exception as exc:
-        raise RuntimeError(f"Failed to call {url}: {exc}") from exc
-
-    if resp.status_code != 200:
-        raise RuntimeError(f"Bad response from {url}: {resp.status_code} {resp.text}")
-
-    payload = resp.json()
-    accounts = payload.get("accounts") or []
-
-    # match by id first; else by name substring (case-insensitive)
-    match = None
-    if account_id:
-        for a in accounts:
-            if str(a.get("id")) == str(account_id):
-                match = a
-                break
-    if match is None and account_name:
-        low = account_name.strip().lower()
-        for a in accounts:
-            nm = (a.get("name") or "").lower()
-            if low in nm:
-                match = a
-                break
-
-    if match is None:
-        raise ValueError(f"Account not found for id='{account_id}' name='{account_name}'")
-
-    balance_str = match.get("balance")
-    if balance_str is None:
-        raise ValueError(f"Account payload missing 'balance' field: {match}")
-
-    return parse_balance_string(balance_str)
 
 # ----------------------
 # Utilities & parsing
@@ -271,42 +170,63 @@ def safe_decimal(s) -> Optional[Decimal]:
     return None
 
 
+
 def parse_pdf2txt_lines(lines: List[str]) -> List[Dict]:
+    """
+    Robust parser that handles page breaks, tail-of-line details, and stray amount lines.
+    Strategy:
+      * Normalize page breaks and strip form-feed characters
+      * Identify date line indices as anchors
+      * Build blocks from date line tail + following lines up to next date index
+      * Track which input line indices were consumed
+      * After initial pass, find any leftover lines that look like transaction lines (contain amount/INR)
+        and attach them to the nearest previous date anchor, then parse them into records.
+      * Deduplicate records using (date, transaction_id, utr_no, amount) key.
+    """
     records = []
-    i = 0
     n = len(lines)
-    while i < n:
-        ln = lines[i].strip()
+
+    # normalize lines: replace form-feed and CRs, keep mapping of normalized lines to original indices
+    norm_lines = []
+    orig_idx_map = []
+    for idx, ln in enumerate(lines):
+        if ln is None:
+            ln = ""
+        ln2 = ln.replace("\f", " ").replace("\r", " ").rstrip("\n")
+        norm_lines.append(ln2)
+        orig_idx_map.append(idx)
+
+    # find indices with dates
+    date_indices = []
+    date_matches = {}
+    for idx, line in enumerate(norm_lines):
+        ln = line.strip()
         m = DATE_FIND_RE.search(ln)
-        if not m:
-            i += 1
-            continue
-        date_token = m.group(1).strip()
+        if m:
+            date_indices.append(idx)
+            date_matches[idx] = m.group(1).strip()
 
-        # find optional time in following lines (skip blank)
-        time_token = ""
-        j = i + 1
-        while j < n and not lines[j].strip():
-            j += 1
-        if j < n:
-            mt = TIME_FIND_RE.search(lines[j].strip())
-            if mt:
-                time_token = mt.group(1).strip()
-                j += 1
+    if not date_indices:
+        return records
 
-        # collect block until next date token
-        block = []
-        while j < n and not DATE_FIND_RE.search(lines[j]):
-            block.append(lines[j])
-            j += 1
-        i = j
+    used_line_idxs = set()
 
-        block_text = " ".join([b.strip() for b in block if b.strip()])
-        if not block_text:
-            continue
+    # helper to parse block_text (extract transaction fields)
+    def parse_block_text(block_text, consumed_idxs) -> Optional[dict]:
+        if not block_text or not block_text.strip():
+            return None
         lowb = block_text.lower()
-        if any(hk in lowb for hk in HEADER_KEYWORDS):
-            continue
+        # If a known header/footer phrase exists in the block, truncate the block at its first occurrence
+        first_pos = None
+        for hk in HEADER_KEYWORDS:
+            pos = lowb.find(hk)
+            if pos != -1 and (first_pos is None or pos < first_pos):
+                first_pos = pos
+        if first_pos is not None:
+            block_text = block_text[:first_pos].strip()
+            lowb = block_text.lower()
+        if not block_text:
+            return None
 
         # extract payee
         paid_to = ""
@@ -354,21 +274,52 @@ def parse_pdf2txt_lines(lines: List[str]) -> List[Dict]:
         elif CREDIT_WORD_RE.search(block_text):
             txn_type = "Credit"
 
-        # normalize numeric string
         amount_val = None
         if amount_txt:
             try:
                 amount_val = f"{float(amount_txt):.2f}"
             except Exception:
                 amount_val = amount_txt
-
-        # sign convention: debit → negative
+        # sign convention
         if txn_type and txn_type.lower() == "debit" and amount_val:
             try:
                 amount_val = f"-{abs(float(amount_val)):.2f}"
             except Exception:
                 pass
 
+        # try to find date token from nearby consumed indices by checking the original lines for date
+        date_token = None
+        for i in consumed_idxs:
+            ln = norm_lines[i]
+            m = DATE_FIND_RE.search(ln)
+            if m:
+                date_token = m.group(1).strip()
+                break
+        # fallback: try to find any date anywhere in block_text
+        if not date_token:
+            mdt = DATE_FIND_RE.search(block_text)
+            if mdt:
+                date_token = mdt.group(1).strip()
+
+        if not date_token:
+            # can't assign date reliably; skip
+            return None
+
+        # time extraction: look for time in consumed_idxs lines
+        time_token = ""
+        for i in consumed_idxs:
+            ln = norm_lines[i]
+            mt = TIME_FIND_RE.search(ln)
+            if mt:
+                time_token = mt.group(1).strip()
+                break
+        # fallback: from block_text
+        if not time_token:
+            mt = TIME_FIND_RE.search(block_text)
+            if mt:
+                time_token = mt.group(1).strip()
+
+        # normalize date/time
         date_norm = normalize_date(date_token)
         time_norm = normalize_time(time_token)
         ts_time = time_norm or "00:00"
@@ -379,25 +330,85 @@ def parse_pdf2txt_lines(lines: List[str]) -> List[Dict]:
             created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
         updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
 
-        if paid_to and paid_to.lower().startswith("date transaction details"):
-            continue
+        rec = {
+            "date": date_norm,
+            "time": time_norm,
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "name": paid_to or "PhonePe",
+            "transaction_id": txn_id or None,
+            "utr_no": utr or None,
+            "type": txn_type or None,
+            "amount": amount_val,
+            "_consumed_idxs": consumed_idxs.copy(),
+        }
+        return rec
 
-        records.append(
-            {
-                "date": date_norm,
-                "time": time_norm,
-                "created_at": created_at,
-                "updated_at": updated_at,
-                "name": paid_to or "PhonePe",
-                "transaction_id": txn_id or None,
-                "utr_no": utr or None,
-                "type": txn_type or None,
-                "amount": amount_val,
-            }
-        )
+    # initial pass: build blocks between date indices
+    for pos_idx, start in enumerate(date_indices):
+        end = date_indices[pos_idx + 1] if pos_idx + 1 < len(date_indices) else len(norm_lines)
+        # collect indices from start to end-1
+        idxs = list(range(start, end))
+        # mark used lines
+        for ii in idxs:
+            used_line_idxs.add(ii)
+        # build and parse block
+        block_lines = [norm_lines[i] for i in idxs]
+        block_text = " ".join([b.strip() for b in block_lines if b.strip()])
+        rec = parse_block_text(block_text, idxs)
+        if rec:
+            records.append(rec)
+
+    # secondary pass: find stray lines that contain amount or INR but were not used; attach to previous date anchor
+    stray_amount_idxs = []
+    for idx, ln in enumerate(norm_lines):
+        if idx in used_line_idxs:
+            continue
+        if INR_AMT_RE.search(ln) or AMOUNT_RE.search(ln):
+            if ln.strip():
+                stray_amount_idxs.append(idx)
+
+    # attach each stray line to nearest previous date index
+    for sidx in stray_amount_idxs:
+        # find previous date anchor index
+        prev_dates = [d for d in date_indices if d < sidx]
+        if not prev_dates:
+            continue
+        anchor = prev_dates[-1]
+        # create consumed idx list: anchor..sidx
+        idxs = list(range(anchor, sidx+1))
+        # avoid reusing already used indices in this constructed block
+        new_idxs = [i for i in idxs if i not in used_line_idxs]
+        if not new_idxs:
+            continue
+        for ii in new_idxs:
+            used_line_idxs.add(ii)
+        block_lines = [norm_lines[i] for i in sorted(set([anchor] + new_idxs))]
+        block_text = " ".join([b.strip() for b in block_lines if b.strip()])
+        rec = parse_block_text(block_text, sorted(set([anchor] + new_idxs)))
+        if rec:
+            # avoid duplicates: check if same txn_id+date+amount exists
+            dup = False
+            for ex in records:
+                if rec.get("transaction_id") and ex.get("transaction_id") and rec["transaction_id"] == ex["transaction_id"]:
+                    dup = True; break
+                if rec.get("amount") and ex.get("amount") and rec["amount"] == ex["amount"] and rec.get("date") == ex.get("date"):
+                    dup = True; break
+            if not dup:
+                records.append(rec)
+
+    # final: remove internal helper key before returning
+    for r in records:
+        if "_consumed_idxs" in r:
+            del r["_consumed_idxs"]
+
+    # sort records by date+time for predictability
+    try:
+        records.sort(key=lambda x: (x.get("date") or "", x.get("time") or ""))
+    except Exception:
+        pass
 
     return records
-
 
 def parse_txt_file(path: Path) -> List[Dict]:
     with open(path, "r", encoding="utf-8", errors="ignore") as fh:
@@ -456,6 +467,7 @@ def find_mask_in_text(block_text: str, masks: Iterable[str]) -> Optional[str]:
 # DB helpers: lookup by mobile and by account_name in locked_attributes
 # ----------------------
 def connect_to_postgres():
+    load_dotenv()
     host = os.getenv("SURE_DB_HOST") or os.getenv("DB_HOST") or "localhost"
     port = int(os.getenv("SURE_DB_PORT") or os.getenv("DB_PORT") or 5432)
     db = os.getenv("SURE_DB_NAME") or os.getenv("DB_NAME")
@@ -577,11 +589,16 @@ def perform_transfer(conn, txn: Dict, self_account: Tuple[str, str]) -> Tuple[st
     if amt is None:
         return ("skip", None, None)
 
+    # if int(amt) > 0:
+    out_amount = -amt
+    in_amount = amt
     if amt > Decimal("0"):
         # incoming to self -> swap
         tmp_id, tmp_name = to_account, to_name
         to_account, to_name = from_account, from_name
         from_account, from_name = tmp_id, tmp_name
+        out_amount = amt
+        in_amount = -amt
 
     source_out = txn.get("transaction_id") or f"PHONEPE-{txn.get('created_at')}"
     source_in = f"{source_out}_IN"
@@ -612,7 +629,6 @@ def perform_transfer(conn, txn: Dict, self_account: Tuple[str, str]) -> Tuple[st
             )
             out_txn_id = cur.fetchone()[0]
 
-            out_amount = -amt
             cur.execute(
                 """
                 INSERT INTO entries (
@@ -640,7 +656,6 @@ def perform_transfer(conn, txn: Dict, self_account: Tuple[str, str]) -> Tuple[st
                 (txn["created_at"], txn["updated_at"], source_in),
             )
             in_txn_id = cur.fetchone()[0]
-            in_amount = amt
 
             cur.execute(
                 """
@@ -699,7 +714,7 @@ def insert_transactions(conn, records: List[Dict], min_date=None, dry_run=False)
                 continue
 
             # Resolve self account by linked_mobile_number (primary) then fallback to env/default
-            (self_account_id, self_account_name) = (None, None)
+            self_account_id = None
             if r.get("linked_mobile_number"):
                 self_account_id, self_account_name = lookup_self_account_by_mobile(conn, r.get("linked_mobile_number"))
             if not self_account_id:
@@ -719,10 +734,10 @@ def insert_transactions(conn, records: List[Dict], min_date=None, dry_run=False)
             # Try internal transfer using DB-based account lookup
             transfer_result = perform_transfer(conn, r, (self_account_id,self_account_name))
             if transfer_result[0] == "created":
-                logger.info("Inserted transfer for source=%s", r.get("transaction_id"))
+                logger.info("Inserted transfer for source=%s, amount=%s", r.get("transaction_id"), r.get("amount"))
                 continue
             elif transfer_result[0] == "exists":
-                logger.info("Transfer exists for source=%s", r.get("transaction_id"))
+                logger.info("Transfer exists for source=%s, amount=%s", r.get("transaction_id"), r.get("amount"))
                 continue
             elif transfer_result[0] == "error":
                 logger.error("Transfer error, will try as expense: %s", transfer_result[1])
@@ -811,8 +826,7 @@ def insert_transactions(conn, records: List[Dict], min_date=None, dry_run=False)
         logger.info("Dry-run CSV written to %s (%d rows)", out_path, len(dry_rows))
 
     logger.info("Done. Inserted %d new expense rows", inserted)
-    status = {"account_id": self_account_id, "account_name": self_account_name, "inserted" : inserted}
-    return status
+    return inserted
 
 def main():
     if len(sys.argv) < 2:
@@ -876,8 +890,6 @@ def main():
 
     conn = connect_to_postgres()
     if not conn:
-        # self_account = lookup_self_account_by_mobile(conn, parsed[0].get("linked_mobile_number"))
-        # print(f"self_account={self_account}")
         logger.error("DB connection failed; abort")
         if parsed:
             out_path = Path("phonepe_parsed_records.json")
@@ -889,10 +901,8 @@ def main():
         return
 
     try:
-        status = insert_transactions(conn, parsed, min_date=min_date, dry_run=dry_run)
-        logger.info("Inserted %d rows", status["inserted"])
-        balance = get_account_balance(account_id=status["account_id"])
-        logger.info("Balance for '%s'=%s", status["account_name"], balance)
+        inserted = insert_transactions(conn, parsed, min_date=min_date, dry_run=dry_run)
+        logger.info("Inserted %d rows", inserted)
     finally:
         conn.close()
 
