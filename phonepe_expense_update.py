@@ -59,6 +59,12 @@ logger = logging.getLogger(__name__)
 logger.info("Logging initialized. Writing to %s", LOG_FILE)
 
 # Regexes
+# Date-range header like: Oct 28, 2025 - Nov 27, 2025 (case-insensitive)
+DATE_RANGE_RE = re.compile(
+    r'\b[A-Za-z]{3,9}\s*\d{1,2},\s*\d{4}\b\s*[-–to]{1,4}\s*\b[A-Za-z]{3,9}\s*\d{1,2},\s*\d{4}\b',
+    re.IGNORECASE,
+)
+
 DATE_FIND_RE = re.compile(
     r'([A-Za-z]{3,9}\s*\d{1,2},\s*\d{4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}-\d{1,2}-\d{1,2})'
 )
@@ -70,6 +76,14 @@ UTR_RE = re.compile(r'UTR\s*No\s*[:\-\s]*([A-Za-z0-9]+)', re.IGNORECASE)
 DEBIT_WORD_RE = re.compile(r'\bDebit\b', re.IGNORECASE)
 CREDIT_WORD_RE = re.compile(r'\bCredit\b', re.IGNORECASE)
 HEADER_KEYWORDS = ["date transaction details", "transaction details", "date transaction details type amount"]
+# Header/header-context phrases to detect first-page header blocks
+PAGE_HEADER_MARKERS = [
+    r"transaction\s+statement\s+for",   # "Transaction Statement for +91..."
+    r"transaction\s+details",          # the "Transaction Details" label
+    r"date\s*$",                       # a lone "Date" line
+]
+PAGE_HEADER_MARKERS_RE = re.compile("|".join(PAGE_HEADER_MARKERS), re.IGNORECASE)
+
 
 DEFAULT_SELF_ACCOUNT_ID = os.getenv("SURE_SELF_ACCOUNT_ID", "54f3d108-9ed2-446c-a489-ed1c2ffdf5b0")
 
@@ -197,14 +211,46 @@ def parse_pdf2txt_lines(lines: List[str]) -> List[Dict]:
         orig_idx_map.append(idx)
 
     # find indices with dates
+    # date_indices = []
+    # date_matches = {}
+    # for idx, line in enumerate(norm_lines):
+    #     ln = line.strip()
+    #     m = DATE_FIND_RE.search(ln)
+    #     if m:
+    #         date_indices.append(idx)
+    #         date_matches[idx] = m.group(1).strip()
+    # find date anchors but skip date-range header lines and obvious page header contexts
+
     date_indices = []
     date_matches = {}
     for idx, line in enumerate(norm_lines):
         ln = line.strip()
+        if not ln:
+            continue
+
+        # Skip lines that are explicit date-range headers like "Oct 28, 2025 - Nov 27, 2025"
+        if 'DATE_RANGE_RE' in globals() and DATE_RANGE_RE.search(ln):
+            continue
+
+        # If the line itself is a lone header token like "Date" or "Transaction Details", skip it
+        if ln.lower() in ("date", "transaction details", "date transaction details"):
+            continue
+
+        # If the nearby context indicates a page header, skip treating this as a date anchor.
+        # Look up to 3 lines back and 2 lines ahead for header markers (masked mobile, "Transaction Statement for", etc.)
+        context_window = " ".join(
+            [norm_lines[i].strip() for i in range(max(0, idx-3), min(len(norm_lines), idx+3)) if norm_lines[i].strip()]
+        )
+        if 'PAGE_HEADER_MARKERS_RE' in globals() and PAGE_HEADER_MARKERS_RE.search(context_window):
+            # This date is embedded in a page header block — ignore as anchor.
+            continue
+
+        # Normal date detection
         m = DATE_FIND_RE.search(ln)
         if m:
             date_indices.append(idx)
             date_matches[idx] = m.group(1).strip()
+
 
     if not date_indices:
         return records
@@ -216,6 +262,13 @@ def parse_pdf2txt_lines(lines: List[str]) -> List[Dict]:
         if not block_text or not block_text.strip():
             return None
         lowb = block_text.lower()
+        if 'DATE_RANGE_RE' in globals() and DATE_RANGE_RE.search(block_text):
+            return None
+
+        # If the block appears to be part of a page header context, skip
+        if 'PAGE_HEADER_MARKERS_RE' in globals() and PAGE_HEADER_MARKERS_RE.search(block_text):
+            return None
+
         # If a known header/footer phrase exists in the block, truncate the block at its first occurrence
         first_pos = None
         for hk in HEADER_KEYWORDS:
@@ -407,6 +460,21 @@ def parse_pdf2txt_lines(lines: List[str]) -> List[Dict]:
         records.sort(key=lambda x: (x.get("date") or "", x.get("time") or ""))
     except Exception:
         pass
+
+
+    # Final defensive filter: drop any parsed record whose name looks like a page header / date-range
+    filtered = []
+    for r in records:
+        nm = (r.get('name') or '').strip()
+        if not nm:
+            continue
+        if 'DATE_RANGE_RE' in globals() and DATE_RANGE_RE.search(nm):
+            # skip header-like names
+            continue
+        if 'PAGE_HEADER_MARKERS_RE' in globals() and PAGE_HEADER_MARKERS_RE.search(nm):
+            continue
+        filtered.append(r)
+    records = filtered
 
     return records
 
