@@ -607,6 +607,125 @@ def lookup_account_by_name(conn, name: str) -> Optional[Dict]:
     return None
 
 
+def lookup_category_for_name_from_transactions(conn, name: str) -> Optional[str]:
+    """
+    Return the most common transactions.category_id for entries whose
+    entryable is a transaction and whose entries.name matches `name`.
+
+    Strategy:
+      1) Exact case-insensitive match on entries.name
+      2) Fallback: case-insensitive substring match on entries.name (LIKE '%name%')
+      3) Return the category_id with the highest count, or None if none found.
+    """
+    if not name:
+        return None
+
+    try:
+        with conn.cursor() as cur:
+            # 1) exact (case-insensitive) match; restrict to likely transaction entryable_types
+            cur.execute(
+                """
+                SELECT t.category_id, COUNT(*) AS cnt
+                FROM entries e
+                JOIN transactions t ON e.entryable_id = t.id
+                WHERE lower(e.name) = lower(%s)
+                  AND t.category_id IS NOT NULL
+                  AND (e.entryable_type ILIKE 'transaction' OR e.entryable_type ILIKE 'transactions' OR e.entryable_type ILIKE 'Transaction' OR e.entryable_type ILIKE 'Transactions')
+                GROUP BY t.category_id
+                ORDER BY cnt DESC
+                LIMIT 1
+                """,
+                (name,),
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                return row[0]
+
+            # 2) fallback: substring match using lower(name) LIKE %pattern%
+            pattern = f"%{name.strip().lower()}%"
+            cur.execute(
+                """
+                SELECT t.category_id, COUNT(*) AS cnt
+                FROM entries e
+                JOIN transactions t ON e.entryable_id = t.id
+                WHERE lower(e.name) LIKE %s
+                  AND t.category_id IS NOT NULL
+                  AND (e.entryable_type ILIKE 'transaction' OR e.entryable_type ILIKE 'transactions' OR e.entryable_type ILIKE 'Transaction' OR e.entryable_type ILIKE 'Transactions')
+                GROUP BY t.category_id
+                ORDER BY cnt DESC
+                LIMIT 1
+                """,
+                (pattern,),
+            )
+            row2 = cur.fetchone()
+            if row2 and row2[0]:
+                return row2[0]
+    except Exception:
+        # keep behavior consistent with your other helpers: log, rollback attempt, then return None
+        try:
+            logger.exception("lookup_category_for_name_from_transactions failed")
+        except Exception:
+            pass
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+    return None
+
+def lookup_category_for_name(conn, name: str) -> Optional[str]:
+    """
+    Find the most common non-null category_id among existing entries with the same (or similar) name.
+    Strategy:
+      1. Try exact case-insensitive match on entries.name.
+      2. If nothing found, try case-insensitive substring match (LIKE '%name%').
+      3. Return the category_id with highest count, or None if none found.
+    """
+    if not name:
+        return None
+    try:
+        with conn.cursor() as cur:
+            # 1) exact (case-insensitive) match
+            cur.execute(
+                """
+                SELECT category_id, COUNT(*) AS cnt
+                FROM entries
+                WHERE lower(name) = lower(%s) AND category_id IS NOT NULL
+                GROUP BY category_id
+                ORDER BY cnt DESC
+                LIMIT 1
+                """,
+                (name,),
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                return row[0]
+
+            # 2) fallback: substring match
+            pattern = f"%{name.strip().lower()}%"
+            cur.execute(
+                """
+                SELECT category_id, COUNT(*) AS cnt
+                FROM entries
+                WHERE lower(name) LIKE %s AND category_id IS NOT NULL
+                GROUP BY category_id
+                ORDER BY cnt DESC
+                LIMIT 1
+                """,
+                (pattern,),
+            )
+            row2 = cur.fetchone()
+            if row2 and row2[0]:
+                return row2[0]
+    except Exception:
+        logger.exception("lookup_category_for_name failed")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    return None
+
+
 def txn_exists(conn, txn_id: Optional[str], utr_no: Optional[str], account_id: Optional[str] = None) -> bool:
     q_by_both = """
         SELECT EXISTS (
@@ -834,16 +953,32 @@ def insert_transactions(conn, records: List[Dict], min_date=None, dry_run=False)
                 continue
 
             try:
+                # with conn.cursor() as cur:
+                #     cur.execute(
+                #         """
+                #         INSERT INTO transactions (created_at, updated_at, category_id, merchant_id, locked_attributes, kind, external_id)
+                #         VALUES (%s, %s, NULL, NULL, %s::jsonb, 'standard', %s)
+                #         RETURNING id
+                #         """,
+                #         (row["created_at"], row["updated_at"], json.dumps(row["locked_attributes"]), row["source"]),
+                #     )
+                #     trans_id = cur.fetchone()[0]
+                #
+
+                # try to inherit category from previous entries with same name
                 with conn.cursor() as cur:
+                    category_id = lookup_category_for_name_from_transactions(conn, row["name"])
                     cur.execute(
                         """
                         INSERT INTO transactions (created_at, updated_at, category_id, merchant_id, locked_attributes, kind, external_id)
-                        VALUES (%s, %s, NULL, NULL, %s::jsonb, 'standard', %s)
+                        VALUES (%s, %s, %s, NULL, %s::jsonb, 'standard', %s)
                         RETURNING id
                         """,
-                        (row["created_at"], row["updated_at"], json.dumps(row["locked_attributes"]), row["source"]),
+                        (row["created_at"], row["updated_at"], category_id, json.dumps(row["locked_attributes"]), row["source"]),
                     )
                     trans_id = cur.fetchone()[0]
+
+                with conn.cursor() as cur:
 
                     cur.execute(
                         """
