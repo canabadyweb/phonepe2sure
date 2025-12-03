@@ -484,6 +484,28 @@ def parse_txt_file(path: Path) -> List[Dict]:
     return parse_pdf2txt_lines(lines)
 
 
+def extract_mobiles_from_pdf(pdf_path: Path) -> List[str]:
+    try:
+        reader = PdfReader(str(pdf_path))
+        if not reader.pages:
+            return []
+        first_page = reader.pages[0]
+        text = first_page.extract_text() or ""
+
+        found = []
+        pattern = re.compile(r"^Transaction Statement for\s+(\+?\d{10,15})")
+
+        m = pattern.search(text)
+        if m:
+            mobile = m.group(1)
+            print("Found:", mobile)
+            found.append(mobile)
+        return found
+    except Exception:
+        logger.exception("Failed extracting masked mobiles from PDF header")
+        return []
+
+
 def extract_masked_mobiles_from_pdf(pdf_path: Path) -> List[str]:
     try:
         reader = PdfReader(str(pdf_path))
@@ -492,8 +514,8 @@ def extract_masked_mobiles_from_pdf(pdf_path: Path) -> List[str]:
         first_page = reader.pages[0]
         text = first_page.extract_text() or ""
 
-        pat_full = re.compile(r"\+\d{11,13}")
-        pat_masked = re.compile(r"\+\s*[0-9Xx\-\s]{6,}\d{2,4}", re.IGNORECASE)
+        pat_full = re.compile(r"\+?\d{10,13}")
+        pat_masked = re.compile(r"\+?\s*9?1?[0-9Xx\-\s]{6,}\d{2,4}", re.IGNORECASE)
 
         found = []
         for m in pat_full.finditer(text):
@@ -558,6 +580,10 @@ def lookup_self_account_by_mobile(conn, mask: Optional[str]) -> Optional[str]:
     """
     if not mask:
         return None
+
+    if len(mask) == 10:
+        mask = '+91' + mask
+
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -1056,7 +1082,8 @@ def main():
 
     if inp.suffix.lower() == ".pdf":
         pdf_to_parse = decrypt_pdf_if_needed(inp)
-        masks = extract_masked_mobiles_from_pdf(pdf_to_parse)
+        # masks = extract_masked_mobiles_from_pdf(pdf_to_parse)
+        masks = extract_mobiles_from_pdf(pdf_to_parse)
         logger.info("Found masked mobiles on page1: %s", masks)
 
         tmp = Path(tempfile.NamedTemporaryFile(delete=False, suffix=".txt").name)
