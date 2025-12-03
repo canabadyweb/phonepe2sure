@@ -199,7 +199,7 @@ def parse_text_for_records(lines: List[str]) -> List[Dict]:
         r'(\d{1,2}:\d{2}\s*(?:AM|PM))\s+'
         r'Transaction\s*ID\s*[:\-\s]*([A-Za-z0-9]+)\s+'
         r'UTR\s*No\.?\s*[:\-\s]*([A-Za-z0-9]+)\s+'
-        r'Paid by\s+(.+?)\s+'
+        r'(?:Paid|Debited|Credited)\s*(?:by|from|to)\s+(.+?)\s+'
         r'(?=(?:[A-Za-z]{3} \d{2}, \d{4}|Page|\Z))'
         , re.IGNORECASE | re.DOTALL
     )
