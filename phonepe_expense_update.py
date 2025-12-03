@@ -69,10 +69,16 @@ DATE_FIND_RE = re.compile(
     r'([A-Za-z]{3,9}\s*\d{1,2},\s*\d{4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}-\d{1,2}-\d{1,2})'
 )
 TIME_FIND_RE = re.compile(r'(\d{1,2}:\d{2}\s*(?:AM|PM))', re.IGNORECASE)
-INR_AMT_RE = re.compile(r'INR\s*([0-9,]+(?:\.[0-9]+)?)', re.IGNORECASE)
+# INR_AMT_RE = re.compile(r'INR\s*([0-9,]+(?:\.[0-9]+)?)', re.IGNORECASE)
+INR_AMT_RE = re.compile(
+    r'(?:INR|₹|Rs\.?)\s*([0-9,]+(?:\.[0-9]+)?)',
+    re.IGNORECASE,
+)
 AMOUNT_RE = re.compile(r'([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)|\d+(?:\.[0-9]+)?)')
+
 TXN_ID_RE = re.compile(r'Transaction\s*ID\s*[:\-\s]*([A-Za-z0-9]+)', re.IGNORECASE)
-UTR_RE = re.compile(r'UTR\s*No\s*[:\-\s]*([A-Za-z0-9]+)', re.IGNORECASE)
+# UTR_RE = re.compile(r'UTR\s*No\s*[:\-\s]*([A-Za-z0-9]+)', re.IGNORECASE)
+UTR_RE = re.compile(r'UTR\s*No\.?\s*[:\-\s]*([A-Za-z0-9]+)', re.IGNORECASE)
 DEBIT_WORD_RE = re.compile(r'\bDebit\b', re.IGNORECASE)
 CREDIT_WORD_RE = re.compile(r'\bCredit\b', re.IGNORECASE)
 HEADER_KEYWORDS = ["date transaction details", "transaction details", "date transaction details type amount"]
