@@ -628,7 +628,25 @@ def connect_to_postgres():
         return None
 
 
-def lookup_self_account_by_mobile(conn, mask: Optional[str]) -> Optional[str]:
+def lookup_self_account_from_paid_by(conn, paid_by: Optional[str]) ->Tuple[str, str]:
+    if not paid_by:
+        return None
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,name FROM accounts WHERE locked_attributes->>'account_number' = %s LIMIT 1",
+                (paid_by,),
+            )
+            row = cur.fetchone()
+            if row:
+                return (row[0],row[1])
+    except Exception:
+        logger.exception("lookup_self_account_from_paid_by failed")
+    return None
+
+
+def lookup_self_account_by_mobile(conn, mask: Optional[str]) ->Tuple[str, str]:
     """
     Find account.id where locked_attributes->>'mobile' = mask (tries with and without leading +).
     """
@@ -843,6 +861,7 @@ def perform_transfer(conn, txn: Dict, self_account: Tuple[str, str]) -> Tuple[st
     Returns ("created"/"exists"/"skip"/"error", outflow_txn_id, inflow_txn_id)
     """
     name = (txn.get("name") or "").strip()
+    type = (txn.get("type") or "Debit").strip().lower()
     matched = lookup_account_by_name(conn, name)
     if not matched:
         return ("skip", None, None)
@@ -857,15 +876,15 @@ def perform_transfer(conn, txn: Dict, self_account: Tuple[str, str]) -> Tuple[st
         return ("skip", None, None)
 
     # if int(amt) > 0:
-    out_amount = -amt
-    in_amount = amt
-    if amt > Decimal("0"):
+    out_amount = amt
+    in_amount = -amt
+    if type == "credit":
         # incoming to self -> swap
         tmp_id, tmp_name = to_account, to_name
         to_account, to_name = from_account, from_name
         from_account, from_name = tmp_id, tmp_name
-        out_amount = amt
-        in_amount = -amt
+        out_amount = -amt
+        in_amount = amt
 
     source_out = txn.get("transaction_id") or f"PHONEPE-{txn.get('created_at')}"
     source_in = f"{source_out}_IN"
@@ -982,8 +1001,10 @@ def insert_transactions(conn, records: List[Dict], min_date=None, dry_run=False)
 
             # Resolve self account by linked_mobile_number (primary) then fallback to env/default
             self_account_id = None
-            if r.get("linked_mobile_number"):
-                self_account_id, self_account_name = lookup_self_account_by_mobile(conn, r.get("linked_mobile_number"))
+            if r.get("paid_by"):
+                self_account_id, self_account_name = lookup_self_account_from_paid_by(conn, r.get("paid_by"))
+            # if r.get("linked_mobile_number"):
+            #     self_account_id, self_account_name = lookup_self_account_by_mobile(conn, r.get("linked_mobile_number"))
             if not self_account_id:
                 self_account_id = os.getenv("SURE_SELF_ACCOUNT_ID") or DEFAULT_SELF_ACCOUNT_ID
                 self_account_name = "SELF_ACCOUNT"
