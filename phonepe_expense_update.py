@@ -190,6 +190,53 @@ def safe_decimal(s) -> Optional[Decimal]:
     return None
 
 
+def parse_text_for_records(lines: List[str]) -> List[Dict]:
+    pattern = re.compile(
+        r'([A-Za-z]{3,9}\s*\d{1,2},\s*\d{4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}-\d{1,2}-\d{1,2})\s+'
+        r'(?:Paid|Add)\s*(?:to|money)\s*[:\-\s]*([A-Za-z0-9\s&]+)\s+'
+        r'(DEBIT|CREDIT)\s+\s+'
+        r'(?:INR|₹|Rs\.?)\s*([0-9,]+(?:\.[0-9]+)?)\s+'
+        r'(\d{1,2}:\d{2}\s*(?:AM|PM))\s+'
+        r'Transaction\s*ID\s*[:\-\s]*([A-Za-z0-9]+)\s+'
+        r'UTR\s*No\.?\s*[:\-\s]*([A-Za-z0-9]+)\s+'
+        r'Paid by\s+(.+?)\s+'
+        r'(?=(?:[A-Za-z]{3} \d{2}, \d{4}|Page|\Z))'
+        , re.IGNORECASE | re.DOTALL
+    )
+    text = '\n'.join(lines)
+    matches = pattern.findall(text)
+
+    records = []
+    for match in matches:
+        # logger.info(match)
+
+        # normalize date/time
+        date_norm = normalize_date(match[0].strip())
+        time_norm = normalize_time(match[4].strip())
+        ts_time = time_norm or "00:00"
+        try:
+            created_dt = datetime.strptime(f"{date_norm} {ts_time}", "%Y-%m-%d %H:%M")
+            created_at = created_dt.strftime("%Y-%m-%d %H:%M:%S.%f")
+        except Exception:
+            created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+
+        record = {
+            "date": date_norm,
+            "time": time_norm,
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "name": match[1].strip() or "PhonePe",
+            "transaction_id": match[5].strip() or None,
+            "utr_no": match[6].strip() or None,
+            "type": match[2].strip() or None,
+            "amount": match[3].strip(),
+            "paid_by": match[7].strip(),
+        }
+        records.append(record)
+
+    return records
+
 
 def parse_pdf2txt_lines(lines: List[str]) -> List[Dict]:
     """
@@ -487,7 +534,8 @@ def parse_pdf2txt_lines(lines: List[str]) -> List[Dict]:
 def parse_txt_file(path: Path) -> List[Dict]:
     with open(path, "r", encoding="utf-8", errors="ignore") as fh:
         lines = [ln.rstrip("\n") for ln in fh]
-    return parse_pdf2txt_lines(lines)
+    # return parse_pdf2txt_lines(lines)
+    return parse_text_for_records(lines)
 
 
 def extract_mobiles_from_pdf(pdf_path: Path) -> List[str]:
