@@ -193,7 +193,7 @@ def safe_decimal(s) -> Optional[Decimal]:
 def parse_text_for_records(lines: List[str]) -> List[Dict]:
     pattern = re.compile(
         r'([A-Za-z]{3,9}\s*\d{1,2},\s*\d{4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}-\d{1,2}-\d{1,2})\s+'
-        r'(?:Paid|Add)\s*(?:to|money)\s*[:\-\s]*([A-Za-z0-9\s&]+)\s+'
+        r'(?:Paid|Add|Received)\s*(?:to|money|from)\s*[:\-\s]*([A-Za-z0-9\s&]+)\s+'
         r'(DEBIT|CREDIT)\s+\s+'
         r'(?:INR|₹|Rs\.?)\s*([0-9,]+(?:\.[0-9]+)?)\s+'
         r'(\d{1,2}:\d{2}\s*(?:AM|PM))\s+'
@@ -205,14 +205,35 @@ def parse_text_for_records(lines: List[str]) -> List[Dict]:
     )
     text = '\n'.join(lines)
     matches = pattern.findall(text)
+    (date_index,name_index,type_index,amount_index,time_index,tx_index,utr_index,paidby_index) = range(8)
+
+    # logger.info("Matches=%s",len(matches))
+    if len(matches) == 0:
+        # For PSG
+        pattern = re.compile(
+            r'([A-Za-z]{3,9}\s*\d{1,2},\s*\d{4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}-\d{1,2}-\d{1,2})\s+'
+            r'(\d{1,2}:\d{2}\s*(?:AM|PM))\s+'
+            r'(?:Paid|Add|Received)\s*(?:to|money|from)\s*[:\-\s]*([A-Za-z0-9\s&]+)\s+'
+            r'Transaction\s*ID\s*[:\-\s]*([A-Za-z0-9]+)\s+'
+            r'(DEBIT|CREDIT)\s+\s+'
+            r'(?:INR|₹|Rs\.?)\s+([0-9,]+(?:\.[0-9]+)?)\s+'
+            r'UTR\s*No\.?\s*[:\-\s]*([A-Za-z0-9]+)\s+'
+            r'(?:Paid|Debited|Credited)\s*(?:by|from|to)\s+(.+?)\s+'
+            r'(?=(?:[A-Za-z]{3} \d{2}, \d{4}|Page|\Z))'
+            , re.IGNORECASE | re.DOTALL
+        )
+        text = '\n'.join(lines)
+
+        matches = pattern.findall(text)
+        (date_index,time_index,name_index,tx_index,type_index,amount_index,utr_index,paidby_index) = range(8)
 
     records = []
     for match in matches:
         # logger.info(match)
 
         # normalize date/time
-        date_norm = normalize_date(match[0].strip())
-        time_norm = normalize_time(match[4].strip())
+        date_norm = normalize_date(match[date_index].strip())
+        time_norm = normalize_time(match[time_index].strip())
         ts_time = time_norm or "00:00"
         try:
             created_dt = datetime.strptime(f"{date_norm} {ts_time}", "%Y-%m-%d %H:%M")
@@ -226,13 +247,15 @@ def parse_text_for_records(lines: List[str]) -> List[Dict]:
             "time": time_norm,
             "created_at": created_at,
             "updated_at": updated_at,
-            "name": match[1].strip() or "PhonePe",
-            "transaction_id": match[5].strip() or None,
-            "utr_no": match[6].strip() or None,
-            "type": match[2].strip() or None,
-            "amount": match[3].strip(),
-            "paid_by": match[7].strip(),
+            "name": match[name_index].strip() or "PhonePe",
+            "transaction_id": match[tx_index].strip() or None,
+            "utr_no": match[utr_index].strip() or None,
+            "type": match[type_index].strip() or None,
+            "amount": match[amount_index].strip(),
+            "paid_by": match[paidby_index].split('\n')[0].strip(),
         }
+
+        logger.info(record)
         records.append(record)
 
     return records
