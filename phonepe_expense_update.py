@@ -901,13 +901,13 @@ def perform_transfer(conn, txn: Dict, self_account: Tuple[str, str]) -> Tuple[st
     # if int(amt) > 0:
     out_amount = amt
     in_amount = -amt
-    if type == "credit":
+    if type.lower() == "credit":
         # incoming to self -> swap
         tmp_id, tmp_name = to_account, to_name
         to_account, to_name = from_account, from_name
         from_account, from_name = tmp_id, tmp_name
-        out_amount = -amt
-        in_amount = amt
+        # out_amount = amt
+        # in_amount = -amt
 
     source_out = txn.get("transaction_id") or f"PHONEPE-{txn.get('created_at')}"
     source_in = f"{source_out}_IN"
