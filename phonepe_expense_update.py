@@ -30,7 +30,7 @@ import sys
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, getcontext
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Iterable
+from typing import Dict, List, Optional, Tuple, Iterable, Match, Iterator
 
 import psycopg2
 import psycopg2.extras
@@ -92,6 +92,45 @@ PAGE_HEADER_MARKERS_RE = re.compile("|".join(PAGE_HEADER_MARKERS), re.IGNORECASE
 
 
 DEFAULT_SELF_ACCOUNT_ID = os.getenv("SURE_SELF_ACCOUNT_ID", "54f3d108-9ed2-446c-a489-ed1c2ffdf5b0")
+
+
+#
+# Standalone Date Iterator
+#
+
+# Single-date pattern (readable)
+DATE_PAT = r"(?:[A-Za-z]{3,9}\s*\d{1,2},\s*\d{4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}-\d{1,2}-\d{1,2})"
+
+# Regex that *detects* a date-range like:  "Nov 06, 2025 - Dec 04, 2025" or "06/11/2025 to 06/12/2025"
+DATE_RANGE_RE = re.compile(
+    rf"\b{DATE_PAT}\b\s*(?:-|–|—|\bto\b)\s*\b{DATE_PAT}\b",
+    flags=re.IGNORECASE
+)
+
+# Candidate single-date regex (no lookarounds here)
+DATE_RE = re.compile(rf"(?P<date>{DATE_PAT})", flags=re.IGNORECASE)
+
+def standalone_date_iter(text: str) -> Iterator[Match]:
+    """
+    Yield only those DATE_RE matches that are NOT part of a date-range.
+    A date-range is detected wherever DATE_RANGE_RE matches.
+    For each candidate DATE_RE match we check if it falls within any
+    date-range span — if so, we skip it.
+    """
+    # Precompute date-range spans so checks are fast
+    range_spans = [(m.start(), m.end()) for m in DATE_RANGE_RE.finditer(text)]
+
+    def in_any_range(start: int, end: int) -> bool:
+        # fast check whether [start,end) overlaps any (rstart, rend)
+        for rstart, rend in range_spans:
+            # overlap if start < rend and end > rstart
+            if start < rend and end > rstart:
+                return True
+        return False
+
+    for m in DATE_RE.finditer(text):
+        if not in_any_range(m.start(), m.end()):
+            yield m
 
 # ----------------------
 # Utilities & parsing
@@ -189,51 +228,310 @@ def safe_decimal(s) -> Optional[Decimal]:
                 return None
     return None
 
+def parse_text_for_tx(lines: List[str]) -> List[Dict]:
+    text = "\n".join(lines)
+
+    # ---------------- REGEX PATTERNS ---------------- #
+    date_re = re.compile(
+        r'(?P<date>'
+        r'(?:[A-Za-z]{3,9}\s*\d{1,2},\s*\d{4}'   # Nov 06, 2025
+        r'|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}'        # 06/11/2025
+        r'|\d{4}-\d{1,2}-\d{1,2})'               # 2025-11-06
+        r')\s+',
+        re.IGNORECASE
+    )
+
+    time_re   = re.compile(r'(?P<time>\d{1,2}:\d{2}\s*(?:AM|PM))\s+', re.IGNORECASE)
+    # payee_re  = re.compile(r'(?P<payee>[A-Za-z0-9\s&\.\-]+)(?=\s*(?:DEBIT|CREDIT|INR|₹))', re.IGNORECASE)
+    payee_re = re.compile(
+    r'(?:Bill|Paid|Add|Received)\s*(?:paid|to|money|from)\s*[:\-\s]*'
+    r'(?P<name>[A-Za-z0-9&.,\-\s\*]+?)'
+    r'(?=\s*(?:Transaction\s*ID|DEBIT|CREDIT|INR|\n\s*\n))',
+    re.IGNORECASE
+)
+    type_re   = re.compile(r'(?P<type>DEBIT|CREDIT)\s+', re.IGNORECASE)
+    amount_re = re.compile(r'(?:INR|₹|Rs\.?)\s*(?P<amount>[0-9,]+(?:\.[0-9]+)?)', re.IGNORECASE)
+    txid_re   = re.compile(r'Transaction\s*ID\s*[:\-\s]*(?P<transaction_id>[A-Za-z0-9\-]+)', re.IGNORECASE)
+    utr_re    = re.compile(r'UTR\s*No\.?\s*[:\-\s]*(?P<utr_no>[A-Za-z0-9\-]+)', re.IGNORECASE)
+    payer_re  = re.compile(r'(?:Paid by|Debited from|Credited to)\s*(?P<payer>([0-9X\-\+]+|UPI Lite|Wallet))', re.IGNORECASE)
+
+    # ---------------- EXTRACT DATA ---------------- #
+    date_list   = [m.groupdict() for m in standalone_date_iter(text)]
+    time_list   = [m.groupdict() for m in time_re.finditer(text)]
+    payee_list  = [m.groupdict() for m in payee_re.finditer(text)]
+    type_list   = [m.groupdict() for m in type_re.finditer(text)]
+    amount_list = [m.groupdict() for m in amount_re.finditer(text)]
+    txid_list   = [m.groupdict() for m in txid_re.finditer(text)]
+    utr_list    = [m.groupdict() for m in utr_re.finditer(text)]
+    payer_list  = [m.groupdict() for m in payer_re.finditer(text)]
+
+    # ---------------- LENGTH VALIDATION ---------------- #
+    lengths = {
+        "date": len(date_list),
+        "time": len(time_list),
+        "name": len(payee_list),
+        "type": len(type_list),
+        "amount": len(amount_list),
+        "transaction_id": len(txid_list),
+        "utr_no": len(utr_list),
+        "payer": len(payer_list),
+    }
+
+    if len(set(lengths.values())) != 1:
+        raise ValueError(
+            "❌ Transaction parsing length mismatch:\n" +
+            "\n".join(f"{k}: {v}" for k, v in lengths.items())
+        )
+
+    # ---------------- MERGE + TRANSFORM ---------------- #
+    now_iso = datetime.now().isoformat()
+    records = []
+
+    for group in zip(
+        date_list, time_list, payee_list, type_list,
+        amount_list, txid_list, utr_list, payer_list
+    ):
+        record = {k: v for d in group for k, v in d.items()}
+
+        # ✅ Parse date + time safely
+        raw_dt = f"{record['date']} {record['time']}"
+
+        try:
+            dt = datetime.strptime(raw_dt, "%b %d, %Y %I:%M %p")
+        except ValueError:
+            try:
+                dt = datetime.strptime(raw_dt, "%d/%m/%Y %I:%M %p")
+            except ValueError:
+                dt = datetime.strptime(raw_dt, "%Y-%m-%d %I:%M %p")
+
+        # ✅ Transform fields
+        record["date"] = dt.date().isoformat()       # YYYY-MM-DD
+        record["created_at"] = dt.isoformat()
+        record["updated_at"] = now_iso
+        record["amount"] = float(record["amount"].replace(",", ""))
+
+        records.append(record)
+    # with open('03-transactions.json', "w", encoding="utf-8") as f:
+    #     json.dump(records, f, indent=2, ensure_ascii=False)
+    #
+    # sys.exit(0)
+
+    return records
+
+def old_parse_text_for_tx(lines: List[str]) -> List[Dict]:
+    text = '\n'.join(lines)
+    # date_re = re.compile(r'(?P<date>[A-Za-z]{3,9}\s*\d{1,2},\s*\d{4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}-\d{1,2}-\d{1,2})\s+', re.IGNORECASE | re.DOTALL)
+    # payee_re = re.compile(r'(?:(?:Bill|Paid|Add|Received)\s*(?:paid|to|money|from)\s*[:\-\s]\s*)(?P<payee>[A-Za-z0-9\s&]+)\s*(Transaction\sID)?(?:DEBIT|CREDIT\s*)?', re.IGNORECASE | re.DOTALL)
+    date_re = re.compile(
+        r'(?P<date>'
+        r'(?:[A-Za-z]{3,9}\s*\d{1,2},\s*\d{4}'          # Nov 06, 2025
+        r'|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}'               # 06/11/2025 or 6-11-25
+        r'|\d{4}-\d{1,2}-\d{1,2})'                      # 2025-11-06
+        r')'
+        r'(?!\s*-\s*(?:[A-Za-z]{3,9}\s*\d{1,2},\s*\d{4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}-\d{1,2}-\d{1,2}))'  # NOT followed by another date
+        r'\s+',
+        re.IGNORECASE | re.DOTALL
+    )
+
+    payee_re = re.compile(
+    r'(?:Bill|Paid|Add|Received)\s*(?:paid|to|money|from)\s*[:\-\s]*'
+    r'(?P<payee>[A-Za-z0-9&.,\-\s\*]+?)'
+    r'(?=\s*(?:Transaction\s*ID|DEBIT|CREDIT|INR|\n\s*\n))',
+    re.IGNORECASE
+)
+
+    type_re = re.compile(r'(?:(?P<type>DEBIT|CREDIT)\s+)', re.IGNORECASE | re.DOTALL)
+    amount_re = re.compile(r'(?:INR|₹|Rs\.?)\s*(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s+', re.IGNORECASE | re.DOTALL)
+    time_re = re.compile(r'(?P<time>\d{1,2}:\d{2}\s*(?:AM|PM))\s+', re.IGNORECASE | re.DOTALL)
+    txid_re = re.compile(r'Transaction\s*ID\s*[:\-\s]*(?P<txid>[A-Za-z0-9\-]+)\s+', re.IGNORECASE | re.DOTALL)
+    utr_re = re.compile(r'UTR\s*No\.?\s*[:\-\s]*(?P<utr>[A-Za-z0-9\-]+)\s+', re.IGNORECASE | re.DOTALL)
+    payer_re = re.compile(r'(?:Paid by|Debited from|Credited to)\s*(?P<payer>[0-9A-Za-z\-\+]+)\s*', re.IGNORECASE | re.DOTALL)
+
+    # date_matches = [m.groupdict() for m in date_re.finditer(text)]
+    date_matches = [m.groupdict() for m in standalone_date_iter(text)]
+    time_matches = [m.groupdict() for m in time_re.finditer(text)]
+    payee_matches = [m.groupdict() for m in payee_re.finditer(text)]
+    type_matches = [m.groupdict() for m in type_re.finditer(text)]
+    amount_matches = [m.groupdict() for m in amount_re.finditer(text)]
+    txid_matches = [m.groupdict() for m in txid_re.finditer(text)]
+    utr_matches = [m.groupdict() for m in utr_re.finditer(text)]
+    payer_matches = [m.groupdict() for m in payer_re.finditer(text)]
+    # logger.info(date_matches)
+    # logger.info('Total dates=%s',len(date_matches))
+    # logger.info(time_matches)
+    # logger.info('Total time=%s',len(time_matches))
+    # logger.info(payee_matches)
+    # logger.info('Total payee=%s',len(payee_matches))
+    # logger.info(type_matches)
+    # logger.info('Total type=%s',len(type_matches))
+    # logger.info(amount_matches)
+    # logger.info('Total amount=%s',len(amount_matches))
+    # logger.info(txid_matches)
+    # logger.info('Total txid=%s',len(txid_matches))
+    # logger.info(utr_matches)
+    # logger.info('Total utr=%s',len(utr_matches))
+    # logger.info(payer_matches)
+    # logger.info('Total payer=%s',len(payer_matches))
 
 def parse_text_for_records(lines: List[str]) -> List[Dict]:
+    """
+    Replacement for original parse_text_for_records — fixes:
+      - use finditer() and m.groupdict() so matches are dicts keyed by named groups
+      - correct the amount named group syntax (?P<amount>...)
+      - keep the two-pattern fallback behavior unchanged
+    """
+    text = '\n'.join(lines)
+
+    # Primary pattern: try a single-pass that captures many variants (named groups)
     pattern = re.compile(
-        r'([A-Za-z]{3,9}\s*\d{1,2},\s*\d{4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}-\d{1,2}-\d{1,2})\s+'
-        r'(?:Paid|Add|Received)\s*(?:to|money|from)\s*[:\-\s]*([A-Za-z0-9\s&]+)\s+'
-        r'(DEBIT|CREDIT)\s+\s+'
-        r'(?:INR|₹|Rs\.?)\s*([0-9,]+(?:\.[0-9]+)?)\s+'
-        r'(\d{1,2}:\d{2}\s*(?:AM|PM))\s+'
-        r'Transaction\s*ID\s*[:\-\s]*([A-Za-z0-9]+)\s+'
-        r'UTR\s*No\.?\s*[:\-\s]*([A-Za-z0-9]+)\s+'
-        r'(?:Paid|Debited|Credited)\s*(?:by|from|to)\s+(.+?)\s+'
+        r'(?P<date>[A-Za-z]{3,9}\s*\d{1,2},\s*\d{4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}-\d{1,2}-\d{1,2})\s+'
+        r'(?:(?:Paid|Add|Received)\s*(?:to|money|from)\s*[:\-\s]*(?P<payee>[A-Za-z0-9\s&]+)\s+)?'
+        r'(?:(?P<type>DEBIT|CREDIT)\s+)?'
+        r'(?:INR|₹|Rs\.?)\s*(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s+'
+        r'(?P<time>\d{1,2}:\d{2}\s*(?:AM|PM))\s+'
+        r'Transaction\s*ID\s*[:\-\s]*(?P<txid>[A-Za-z0-9\-]+)\s+'
+        r'UTR\s*No\.?\s*[:\-\s]*(?P<utr>[A-Za-z0-9\-]+)\s+'
+        r'(?:Paid|Debited|Credited)\s*(?:by|from|to)\s*(?P<payer>[Xx0-9A-Za-z\-\+]+)\s*'
+        r'(?=(?:[A-Za-z]{3} \d{2}, \d{4}|Page|\Z))',
+        re.IGNORECASE | re.DOTALL
+    )
+
+    # Use finditer -> groupdict so match['date'] works
+    matches = [m.groupdict() for m in pattern.finditer(text)]
+
+    # If primary pattern finds nothing, use fallback pattern (older ordering)
+    if len(matches) == 0:
+        edge_pattern = re.compile(
+            r'(?P<date>[A-Za-z]{3,9}\s*\d{1,2},\s*\d{4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}-\d{1,2}-\d{1,2})\s+'
+            r'(?P<time>\d{1,2}:\d{2}\s*(?:AM|PM))\s+'
+            r'(?:(?:Paid|Add|Received)\s*(?:to|money|from)\s*[:\-\s]*(?P<payee>[A-Za-z0-9\s&]+)\s+)?\s+'
+            r'Transaction\s*ID\s*[:\-\s]*(?P<txid>[A-Za-z0-9\-]+)\s+'
+            r"UTR\s*No\s*:\s*(?P<utr>\d+)\s*"
+            r'(?:Paid|Debited|Credited)\s*(?:by|from|to)\s*(?P<payer>[Xx0-9A-Za-z\-\+]+)\s*'
+            r"Type\s+Amount\s+"
+            r"(?P<type>Debit|Credit)\s*"
+            r"(?P<amount>INR\s*[0-9.,]+)",
+            re.DOTALL | re.IGNORECASE
+        )
+        edge_matches = [m.groupdict() for m in edge_pattern.finditer(text)]
+
+        fallback = re.compile(
+            r'(?P<date>[A-Za-z]{3,9}\s*\d{1,2},\s*\d{4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}-\d{1,2}-\d{1,2})\s+'
+            r'(?P<time>\d{1,2}:\d{2}\s*(?:AM|PM))\s+'
+            r'(?:(?:Paid|Add|Received)\s*(?:to|money|from)\s*[:\-\s]*(?P<payee>[A-Za-z0-9\s&]+)\s+)?'
+            r'Transaction\s*ID\s*[:\-\s]*(?P<txid>[A-Za-z0-9\-]+)\s+'
+            r'(?:(?P<type>DEBIT|CREDIT)\s+)?'
+            r'(?:INR|₹|Rs\.?)\s*(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s+'
+            r'UTR\s*No\.?\s*[:\-\s]*(?P<utr>[A-Za-z0-9\-]+)\s+'
+            r'(?:Paid|Debited|Credited)\s*(?:by|from|to)\s*(?P<payer>[Xx0-9A-Za-z\-\+]+)\s*'
+            r'(?=(?:[A-Za-z]{3} \d{2}, \d{4}|Page|\Z))',
+            re.IGNORECASE | re.DOTALL
+        )
+        fallback_matches = [m.groupdict() for m in fallback.finditer(text)]
+        matches = [*edge_matches]
+
+
+    records = []
+    for match in matches:
+        # defensive: match may be a dict with None values
+        date_raw = (match.get('date') or "").strip()
+        time_raw = (match.get('time') or "").strip()
+        txid_raw = (match.get('txid') or "").strip()
+        utr_raw = (match.get('utr') or "").strip()
+        payee_raw = (match.get('payee') or "").strip()
+        type_raw = (match.get('type') or "").strip()
+        amount_raw = (match.get('amount') or "").strip()
+        payer_raw = (match.get('payer') or "").strip()
+
+        # normalize date/time (reuse your helpers)
+        date_norm = normalize_date(date_raw) if date_raw else ""
+        time_norm = normalize_time(time_raw) if time_raw else ""
+
+        ts_time = time_norm or "00:00"
+        try:
+            created_dt = datetime.strptime(f"{date_norm} {ts_time}", "%Y-%m-%d %H:%M")
+            created_at = created_dt.strftime("%Y-%m-%d %H:%M:%S.%f")
+        except Exception:
+            created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+
+        # amount normalization (keep as string like earlier code did; safe_decimal will later convert)
+        amount_val = amount_raw.replace(",", "") if amount_raw else None
+        if amount_val:
+            # keep sign convention used previously: Debit => negative
+            if type_raw and type_raw.lower() == 'debit':
+                try:
+                    amount_val = f"-{abs(float(amount_val)):.2f}"
+                except Exception:
+                    amount_val = "-" + amount_val
+            else:
+                try:
+                    amount_val = f"{abs(float(amount_val)):.2f}"
+                except Exception:
+                    pass
+
+        record = {
+            "date": date_norm,
+            "time": time_norm,
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "name": payee_raw or "PhonePe",
+            "transaction_id": txid_raw or None,
+            "utr_no": utr_raw or None,
+            "type": type_raw or None,
+            "amount": amount_val,
+            "payer": payer_raw.split('\n')[0].strip() if payer_raw else None,
+        }
+
+        logger.info(record)
+        records.append(record)
+
+    return records
+
+def old_parse_text_for_records(lines: List[str]) -> List[Dict]:
+    pattern = re.compile(
+        r'(?P<date>[A-Za-z]{3,9}\s*\d{1,2},\s*\d{4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}-\d{1,2}-\d{1,2})\s+'
+        r'(?:Paid|Add|Received)\s*(?:to|money|from)\s*[:\-\s]*(?P<payee>[A-Za-z0-9\s&]+)\s+'
+        r'(?P<type>DEBIT|CREDIT)\s+\s+'
+        r'(?:INR|₹|Rs\.?)\s*([?P<amount>0-9,]+(?:\.[0-9]+)?)\s+'
+        r'(?P<time>\d{1,2}:\d{2}\s*(?:AM|PM))\s+'
+        r'Transaction\s*ID\s*[:\-\s]*(?P<txid>[A-Za-z0-9]+)\s+'
+        r'UTR\s*No\.?\s*[:\-\s]*(?P<utr>[A-Za-z0-9]+)\s+'
+        r'(?:Paid|Debited|Credited)\s*(?:by|from|to)\s+(?P<payer>[Xx0-9]+)\s+'
         r'(?=(?:[A-Za-z]{3} \d{2}, \d{4}|Page|\Z))'
         , re.IGNORECASE | re.DOTALL
     )
     text = '\n'.join(lines)
     matches = pattern.findall(text)
-    (date_index,name_index,type_index,amount_index,time_index,tx_index,utr_index,paidby_index) = range(8)
+    # (date_index,name_index,type_index,amount_index,time_index,tx_index,utr_index,paidby_index) = range(8)
 
     # logger.info("Matches=%s",len(matches))
     if len(matches) == 0:
         # For PSG
         pattern = re.compile(
-            r'([A-Za-z]{3,9}\s*\d{1,2},\s*\d{4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}-\d{1,2}-\d{1,2})\s+'
-            r'(\d{1,2}:\d{2}\s*(?:AM|PM))\s+'
-            r'(?:Paid|Add|Received)\s*(?:to|money|from)\s*[:\-\s]*([A-Za-z0-9\s&]+)\s+'
-            r'Transaction\s*ID\s*[:\-\s]*([A-Za-z0-9]+)\s+'
-            r'(DEBIT|CREDIT)\s+\s+'
-            r'(?:INR|₹|Rs\.?)\s+([0-9,]+(?:\.[0-9]+)?)\s+'
-            r'UTR\s*No\.?\s*[:\-\s]*([A-Za-z0-9]+)\s+'
-            r'(?:Paid|Debited|Credited)\s*(?:by|from|to)\s+(.+?)\s+'
+            r'(?P<date>[A-Za-z]{3,9}\s*\d{1,2},\s*\d{4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}-\d{1,2}-\d{1,2})\s+'
+            r'(?P<time>\d{1,2}:\d{2}\s*(?:AM|PM))\s+'
+            r'(?:Paid|Add|Received)\s*(?:to|money|from)\s*[:\-\s]*(?P<payee>[A-Za-z0-9\s&]+)\s+'
+            r'Transaction\s*ID\s*[:\-\s]*(?P<txid>[A-Za-z0-9]+)\s+'
+            r'(?P<type>DEBIT|CREDIT)\s+\s+'
+            r'(?:INR|₹|Rs\.?)\s+(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s+'
+            r'UTR\s*No\.?\s*[:\-\s]*(?P<utr>[A-Za-z0-9]+)\s+'
+            r'(?:Paid|Debited|Credited)\s*(?:by|from|to)\s+(?P<payer>[Xx0-9]+)\s+'
             r'(?=(?:[A-Za-z]{3} \d{2}, \d{4}|Page|\Z))'
             , re.IGNORECASE | re.DOTALL
         )
         text = '\n'.join(lines)
 
         matches = pattern.findall(text)
-        (date_index,time_index,name_index,tx_index,type_index,amount_index,utr_index,paidby_index) = range(8)
+        # (date_index,time_index,name_index,tx_index,type_index,amount_index,utr_index,paidby_index) = range(8)
 
     records = []
     for match in matches:
         # logger.info(match)
 
         # normalize date/time
-        date_norm = normalize_date(match[date_index].strip())
-        time_norm = normalize_time(match[time_index].strip())
+        date_norm = normalize_date(match['date'].strip())
+        time_norm = normalize_time(match['time'].strip())
         ts_time = time_norm or "00:00"
         try:
             created_dt = datetime.strptime(f"{date_norm} {ts_time}", "%Y-%m-%d %H:%M")
@@ -247,12 +545,12 @@ def parse_text_for_records(lines: List[str]) -> List[Dict]:
             "time": time_norm,
             "created_at": created_at,
             "updated_at": updated_at,
-            "name": match[name_index].strip() or "PhonePe",
-            "transaction_id": match[tx_index].strip() or None,
-            "utr_no": match[utr_index].strip() or None,
-            "type": match[type_index].strip() or None,
-            "amount": match[amount_index].strip(),
-            "paid_by": match[paidby_index].split('\n')[0].strip(),
+            "name": match['payee'].strip() or "PhonePe",
+            "transaction_id": match['txid'].strip() or None,
+            "utr_no": match['utr'].strip() or None,
+            "type": match['type'].strip() or None,
+            "amount": match['amount'].strip(),
+            "payer": match['payer'].split('\n')[0].strip(),
         }
 
         logger.info(record)
@@ -558,7 +856,8 @@ def parse_txt_file(path: Path) -> List[Dict]:
     with open(path, "r", encoding="utf-8", errors="ignore") as fh:
         lines = [ln.rstrip("\n") for ln in fh]
     # return parse_pdf2txt_lines(lines)
-    return parse_text_for_records(lines)
+    # return parse_text_for_records(lines)
+    return parse_text_for_tx(lines)
 
 
 def extract_mobiles_from_pdf(pdf_path: Path) -> List[str]:
@@ -651,21 +950,21 @@ def connect_to_postgres():
         return None
 
 
-def lookup_self_account_from_paid_by(conn, paid_by: Optional[str]) ->Tuple[str, str]:
-    if not paid_by:
+def lookup_self_account_from_payer(conn, payer: Optional[str]) ->Tuple[str, str]:
+    if not payer:
         return None
 
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id,name FROM accounts WHERE locked_attributes->>'account_number' = %s LIMIT 1",
-                (paid_by,),
+                (payer,),
             )
             row = cur.fetchone()
             if row:
                 return (row[0],row[1])
     except Exception:
-        logger.exception("lookup_self_account_from_paid_by failed")
+        logger.exception("lookup_self_account_from_payer failed")
     return None
 
 
@@ -1024,8 +1323,8 @@ def insert_transactions(conn, records: List[Dict], min_date=None, dry_run=False)
 
             # Resolve self account by linked_mobile_number (primary) then fallback to env/default
             self_account_id = None
-            if r.get("paid_by"):
-                self_account_id, self_account_name = lookup_self_account_from_paid_by(conn, r.get("paid_by"))
+            if r.get("payer"):
+                self_account_id, self_account_name = lookup_self_account_from_payer(conn, r.get("payer"))
             # if r.get("linked_mobile_number"):
             #     self_account_id, self_account_name = lookup_self_account_by_mobile(conn, r.get("linked_mobile_number"))
             if not self_account_id:
@@ -1236,3 +1535,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
